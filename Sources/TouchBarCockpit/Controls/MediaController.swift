@@ -1,6 +1,6 @@
 import AppKit
 import ApplicationServices
-import Carbon
+import CoreGraphics
 import CPrivateAPIs
 
 struct NowPlayingState {
@@ -12,7 +12,7 @@ struct NowPlayingState {
     }
 
     var source: Source = .universal
-    var title: String = "No Media Playing"
+    var title: String = "No Active Media"
     var artist: String = ""
     var duration: Double = 0
     var elapsed: Double = 0
@@ -40,9 +40,10 @@ final class MediaController {
     private(set) var lastState = NowPlayingState()
     private var lastPlayingBundleID: String? = nil
 
-    // Permission tracking (non-blocking consent flow)
-    private var consentInFlight: Set<String> = []
-    private var deniedUntil: [String: CFAbsoluteTime] = [:]
+    // Live push cache populated instantaneously via DistributedNotificationCenter
+    // (Spotify: com.spotify.client.PlaybackStateChanged, Apple Music: com.apple.Music.playerInfo)
+    // Works with ZERO Automation permission & 0ms latency!
+    private var pushedStates: [String: NowPlayingState] = [:]
 
     // Caches
     private var cachedArtworkKey: String = ""
@@ -50,7 +51,7 @@ final class MediaController {
     private var artworkFetchInFlightKey: String? = nil
     private var appIconCache: [String: NSImage] = [:]
 
-    // Called on main thread whenever async artwork finishes downloading or active player terminates
+    // Called on main thread whenever live playback state or async artwork updates
     var onStateUpdated: ((NowPlayingState) -> Void)?
 
     private lazy var urlSession: URLSession = {
@@ -60,10 +61,139 @@ final class MediaController {
         return URLSession(configuration: cfg)
     }()
 
-    // MARK: - App Lifecycle Cleanup (Eliminates Stale Info When Closing Apple Music / Spotify / VLC)
+    private init() {
+        setupDistributedPlayerObservers()
+    }
+
+    // MARK: - Zero-Permission Live Push Observers (Spotify & Apple Music)
+    private func setupDistributedPlayerObservers() {
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(
+            forName: Notification.Name("com.spotify.client.PlaybackStateChanged"),
+            object: nil,
+            queue: nil
+        ) { [weak self] note in
+            self?.handleSpotifyNotification(note.userInfo)
+        }
+        dnc.addObserver(
+            forName: Notification.Name("com.apple.Music.playerInfo"),
+            object: nil,
+            queue: nil
+        ) { [weak self] note in
+            self?.handleMusicNotification(note.userInfo)
+        }
+    }
+
+    private func handleSpotifyNotification(_ info: [AnyHashable: Any]?) {
+        guard let info = info else { return }
+        let playerState = (info["Player State"] as? String ?? "").lowercased()
+        let title = info["Name"] as? String ?? ""
+        let artist = info["Artist"] as? String ?? ""
+        // Spotify broadcasts Duration in milliseconds and Playback Position in seconds
+        let rawDur = (info["Duration"] as? NSNumber)?.doubleValue ?? 0
+        let dur = rawDur > 3600 ? (rawDur / 1000.0) : rawDur
+        let pos = (info["Playback Position"] as? NSNumber)?.doubleValue ?? 0
+        let isPlaying = (playerState == "playing")
+
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if playerState == "stopped" || title.isEmpty {
+                self.pushedStates.removeValue(forKey: "com.spotify.client")
+                return
+            }
+            let cacheKey = "spotify|\(title)|\(artist)"
+            let existingArt = (self.cachedArtworkKey == cacheKey) ? self.cachedArtworkImage : nil
+            let state = NowPlayingState(
+                source: .spotify,
+                title: title,
+                artist: artist,
+                duration: dur,
+                elapsed: pos,
+                isPlaying: isPlaying,
+                canSeek: dur > 0,
+                artwork: existingArt,
+                appIcon: self.iconForApp(bundleID: "com.spotify.client"),
+                appBundleID: "com.spotify.client",
+                fetchedAt: Date()
+            )
+            self.pushedStates["com.spotify.client"] = state
+            if isPlaying {
+                self.lastPlayingBundleID = "com.spotify.client"
+            }
+            // Promote immediately if playing or if Spotify is our active source
+            if isPlaying || self.lastState.appBundleID == "com.spotify.client" || self.lastState.appBundleID == nil {
+                self.lastState = state
+                DispatchQueue.main.async {
+                    self.onStateUpdated?(state)
+                }
+                // Try fetching Spotify album art via AppleScript asynchronously if not cached yet
+                if existingArt == nil {
+                    self.fetchSpotifyArtworkAsync(cacheKey: cacheKey)
+                }
+            }
+        }
+    }
+
+    private func handleMusicNotification(_ info: [AnyHashable: Any]?) {
+        guard let info = info else { return }
+        let playerState = (info["Player State"] as? String ?? "").lowercased()
+        let title = info["Name"] as? String ?? ""
+        let artist = info["Artist"] as? String ?? ""
+        // Apple Music broadcasts Total Time in milliseconds
+        let rawDur = (info["Total Time"] as? NSNumber)?.doubleValue ?? 0
+        let dur = rawDur > 3600 ? (rawDur / 1000.0) : rawDur
+        let isPlaying = (playerState == "playing")
+
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if playerState == "stopped" || title.isEmpty {
+                self.pushedStates.removeValue(forKey: "com.apple.Music")
+                return
+            }
+            let cacheKey = "music|\(title)|\(artist)"
+            let existingArt = (self.cachedArtworkKey == cacheKey) ? self.cachedArtworkImage : nil
+            let prevPos = (self.lastState.title == title && self.lastState.source == .music)
+                ? self.lastState.interpolatedElapsed()
+                : 0
+            let state = NowPlayingState(
+                source: .music,
+                title: title,
+                artist: artist,
+                duration: dur,
+                elapsed: prevPos,
+                isPlaying: isPlaying,
+                canSeek: dur > 0,
+                artwork: existingArt,
+                appIcon: self.iconForApp(bundleID: "com.apple.Music"),
+                appBundleID: "com.apple.Music",
+                fetchedAt: Date()
+            )
+            self.pushedStates["com.apple.Music"] = state
+            if isPlaying {
+                self.lastPlayingBundleID = "com.apple.Music"
+            }
+            if isPlaying || self.lastState.appBundleID == "com.apple.Music" || self.lastState.appBundleID == nil {
+                self.lastState = state
+                DispatchQueue.main.async {
+                    self.onStateUpdated?(state)
+                }
+                // Refresh exact elapsed position & artwork via AppleScript
+                if let exact = self.queryMusic() {
+                    self.pushedStates["com.apple.Music"] = exact
+                    self.lastState = exact
+                    DispatchQueue.main.async {
+                        self.onStateUpdated?(exact)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - App Lifecycle Cleanup (Eliminates Stale Info Immediately When Closing Any Player)
     func handleAppTerminated(bundleID: String) {
         queue.async { [weak self] in
             guard let self = self else { return }
+            self.pushedStates.removeValue(forKey: bundleID)
             if self.lastPlayingBundleID == bundleID {
                 self.lastPlayingBundleID = nil
             }
@@ -96,7 +226,7 @@ final class MediaController {
         return icon
     }
 
-    // MARK: - Fetch Live Metadata (Smart Priority: Playing Native > Frontmost App > Last Playing > Any Native > Browser Tab)
+    // MARK: - Fetch Live Metadata (No Deadlocking AEDeterminePermission; Combines Direct NSAppleScript + Push Cache + Cross-Space Windows)
     func fetchNowPlaying(completion: @escaping (NowPlayingState) -> Void) {
         let runningApps = NSWorkspace.shared.runningApplications
         let runningIDs = Set(runningApps.compactMap { $0.bundleIdentifier })
@@ -106,7 +236,10 @@ final class MediaController {
         queue.async { [weak self] in
             guard let self = self else { return }
 
-            // Purge stale lastState if its app is no longer running
+            // Purge any state belonging to terminated apps
+            for bid in Array(self.pushedStates.keys) where !runningIDs.contains(bid) {
+                self.pushedStates.removeValue(forKey: bid)
+            }
             if let oldBid = self.lastState.appBundleID, !runningIDs.contains(oldBid) {
                 self.lastState = NowPlayingState()
                 self.cachedArtworkKey = ""
@@ -116,31 +249,36 @@ final class MediaController {
                 self.lastPlayingBundleID = nil
             }
 
-            // Query all running native players (fast ~3ms each when permitted; non-blocking consent if needed)
+            // Gather live state from running native players (Direct NSAppleScript -> falls back to DistributedNotification push cache -> falls back to cross-Space window title)
             var nativeStates: [String: NowPlayingState] = [:]
+
             if runningIDs.contains("com.spotify.client") {
-                if self.checkAutomationPermission(bundleID: "com.spotify.client"),
-                   let s = self.querySpotify() {
+                if let s = self.querySpotify() {
                     nativeStates["com.spotify.client"] = s
-                } else if let axSpotify = self.fallbackSpotifyFromAX(runningApps: runningApps) {
-                    nativeStates["com.spotify.client"] = axSpotify
+                    self.pushedStates["com.spotify.client"] = s
+                } else if let pushed = self.pushedStates["com.spotify.client"] {
+                    nativeStates["com.spotify.client"] = pushed
+                } else if let winSpotify = self.fallbackSpotifyFromWindows(runningApps: runningApps) {
+                    nativeStates["com.spotify.client"] = winSpotify
                 }
             }
-            if runningIDs.contains("com.apple.Music"),
-               self.checkAutomationPermission(bundleID: "com.apple.Music"),
-               let m = self.queryMusic() {
-                nativeStates["com.apple.Music"] = m
+
+            if runningIDs.contains("com.apple.Music") {
+                if let m = self.queryMusic() {
+                    nativeStates["com.apple.Music"] = m
+                    self.pushedStates["com.apple.Music"] = m
+                } else if let pushed = self.pushedStates["com.apple.Music"] {
+                    nativeStates["com.apple.Music"] = pushed
+                }
             }
-            if runningIDs.contains("org.videolan.vlc"),
-               self.checkAutomationPermission(bundleID: "org.videolan.vlc"),
-               let v = self.queryVLC() {
+
+            if runningIDs.contains("org.videolan.vlc"), let v = self.queryVLC() {
                 nativeStates["org.videolan.vlc"] = v
             }
 
             var detected: NowPlayingState? = nil
 
-            // Priority 1: Any native player that is actively PLAYING right now
-            // (If frontmost app is playing, prefer it; else check Spotify -> Music -> VLC)
+            // Priority 1: Any native player currently PLAYING
             if let fBid = frontBid, let st = nativeStates[fBid], st.isPlaying {
                 detected = st
             } else {
@@ -152,24 +290,24 @@ final class MediaController {
                 }
             }
 
-            // Priority 2: If a native player is frontmost (even if paused), show it!
+            // Priority 2: Frontmost native player (even if paused)
             if detected == nil, let fBid = frontBid, let st = nativeStates[fBid] {
                 detected = st
             }
 
-            // Priority 3: If frontmost app is a browser/video player with an active media tab (YouTube, IINA, etc.)
+            // Priority 3: Frontmost browser / video player with a media tab (YouTube, IINA)
             if detected == nil,
                Self.isBrowserOrVideoBundle(frontBid),
                let browserMedia = self.detectBrowserOrPlayerWindowMedia(runningApps: runningApps, frontmost: frontApp) {
                 detected = browserMedia
             }
 
-            // Priority 4: Last native player that was playing (if still running with a track)
+            // Priority 4: Most recently playing native player still running
             if detected == nil, let lpBid = self.lastPlayingBundleID, let st = nativeStates[lpBid] {
                 detected = st
             }
 
-            // Priority 5: Any running native player with a loaded track (Spotify -> Music -> VLC)
+            // Priority 5: Any running native player with a loaded track
             if detected == nil {
                 for bid in ["com.spotify.client", "com.apple.Music", "org.videolan.vlc"] {
                     if let st = nativeStates[bid] {
@@ -179,7 +317,7 @@ final class MediaController {
                 }
             }
 
-            // Priority 6: Background browser media tab (YouTube / YouTube Music / IINA)
+            // Priority 6: Background browser media tab across any Space
             if detected == nil,
                let browserMedia = self.detectBrowserOrPlayerWindowMedia(runningApps: runningApps, frontmost: frontApp) {
                 detected = browserMedia
@@ -192,7 +330,6 @@ final class MediaController {
                     self.lastPlayingBundleID = bid
                 }
             } else {
-                // Fresh clean fallback — NEVER carry over stale title/artwork/appIcon from a closed app!
                 finalState = NowPlayingState(
                     source: .universal,
                     title: "No Active Media",
@@ -215,7 +352,7 @@ final class MediaController {
         }
     }
 
-    // MARK: - Transport Controls (Targets active native player directly when known, universal HID otherwise!)
+    // MARK: - Transport Controls (Direct when native player active & permitted, universal HID fallback)
     func togglePlayPause(completion: ((NowPlayingState) -> Void)? = nil) {
         let runningIDs = Set(NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier })
         queue.async { [weak self] in
@@ -224,11 +361,11 @@ final class MediaController {
 
             if let bid = self.lastState.appBundleID, runningIDs.contains(bid) {
                 switch self.lastState.source {
-                case .spotify where self.checkAutomationPermission(bundleID: "com.spotify.client"):
+                case .spotify:
                     handled = (self.runInProcessAppleScript("tell application \"Spotify\" to playpause") != nil)
-                case .music where self.checkAutomationPermission(bundleID: "com.apple.Music"):
+                case .music:
                     handled = (self.runInProcessAppleScript("tell application \"Music\" to playpause") != nil)
-                case .vlc where self.checkAutomationPermission(bundleID: "org.videolan.vlc"):
+                case .vlc:
                     handled = (self.runInProcessAppleScript("tell application \"VLC\" to play") != nil)
                 default:
                     break
@@ -236,8 +373,7 @@ final class MediaController {
             }
 
             if !handled {
-                // Universal HID NX_KEYTYPE_PLAY (controls Zen YouTube, Chrome, Safari, IINA, or macOS Now Playing)
-                TBPostAuxKey(16, false)
+                TBPostAuxKey(16, false) // NX_KEYTYPE_PLAY
                 self.lastState.isPlaying.toggle()
                 self.lastState.fetchedAt = Date()
             }
@@ -258,11 +394,11 @@ final class MediaController {
 
             if let bid = self.lastState.appBundleID, runningIDs.contains(bid) {
                 switch self.lastState.source {
-                case .spotify where self.checkAutomationPermission(bundleID: "com.spotify.client"):
+                case .spotify:
                     handled = (self.runInProcessAppleScript("tell application \"Spotify\" to next track") != nil)
-                case .music where self.checkAutomationPermission(bundleID: "com.apple.Music"):
+                case .music:
                     handled = (self.runInProcessAppleScript("tell application \"Music\" to next track") != nil)
-                case .vlc where self.checkAutomationPermission(bundleID: "org.videolan.vlc"):
+                case .vlc:
                     handled = (self.runInProcessAppleScript("tell application \"VLC\" to next") != nil)
                 default:
                     break
@@ -270,7 +406,7 @@ final class MediaController {
             }
 
             if !handled {
-                TBPostAuxKey(19, false) // NX_KEYTYPE_FAST
+                TBPostAuxKey(19, false)
             }
 
             if let completion = completion {
@@ -289,11 +425,11 @@ final class MediaController {
 
             if let bid = self.lastState.appBundleID, runningIDs.contains(bid) {
                 switch self.lastState.source {
-                case .spotify where self.checkAutomationPermission(bundleID: "com.spotify.client"):
+                case .spotify:
                     handled = (self.runInProcessAppleScript("tell application \"Spotify\" to previous track") != nil)
-                case .music where self.checkAutomationPermission(bundleID: "com.apple.Music"):
+                case .music:
                     handled = (self.runInProcessAppleScript("tell application \"Music\" to previous track") != nil)
-                case .vlc where self.checkAutomationPermission(bundleID: "org.videolan.vlc"):
+                case .vlc:
                     handled = (self.runInProcessAppleScript("tell application \"VLC\" to previous") != nil)
                 default:
                     break
@@ -301,7 +437,7 @@ final class MediaController {
             }
 
             if !handled {
-                TBPostAuxKey(20, false) // NX_KEYTYPE_REWIND
+                TBPostAuxKey(20, false)
             }
 
             if let completion = completion {
@@ -367,82 +503,47 @@ final class MediaController {
         }
     }
 
-    // MARK: - Non-Blocking Automation Permission Check
-    private func checkAutomationPermission(bundleID: String) -> Bool {
-        let now = CFAbsoluteTimeGetCurrent()
-        if let until = deniedUntil[bundleID], now < until {
-            return false
-        }
+    // MARK: - Cross-Space Window Title Detection (CGWindowList + AXUIElement)
+    private func allWindowTitles(forPID pid: pid_t) -> [String] {
+        var titles: [String] = []
 
-        var targetDesc = AEAddressDesc()
-        guard let cStr = bundleID.cString(using: .utf8) else { return false }
-        guard AECreateDesc(DescType(typeApplicationBundleID), cStr, strlen(cStr), &targetDesc) == noErr else {
-            return false
-        }
-        defer { AEDisposeDesc(&targetDesc) }
-
-        // First do an instant non-blocking check
-        let status = AEDeterminePermissionToAutomateTarget(
-            &targetDesc,
-            AEEventClass(typeWildCard),
-            AEEventID(typeWildCard),
-            false
-        )
-
-        if status == noErr {
-            deniedUntil.removeValue(forKey: bundleID)
-            return true
-        }
-
-        if status == OSStatus(errAEEventWouldRequireUserConsent) {
-            // Trigger the consent dialog on a detached thread so MediaController.queue NEVER blocks!
-            if !consentInFlight.contains(bundleID) {
-                consentInFlight.insert(bundleID)
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    var askDesc = AEAddressDesc()
-                    if let s = bundleID.cString(using: .utf8),
-                       AECreateDesc(DescType(typeApplicationBundleID), s, strlen(s), &askDesc) == noErr {
-                        let askStatus = AEDeterminePermissionToAutomateTarget(
-                            &askDesc,
-                            AEEventClass(typeWildCard),
-                            AEEventID(typeWildCard),
-                            true
-                        )
-                        AEDisposeDesc(&askDesc)
-                        self?.queue.async {
-                            self?.consentInFlight.remove(bundleID)
-                            if askStatus == noErr {
-                                self?.deniedUntil.removeValue(forKey: bundleID)
-                                self?.fetchNowPlaying { state in
-                                    self?.onStateUpdated?(state)
-                                }
-                            } else {
-                                // Back off 15s before checking again in case user enables in System Settings
-                                self?.deniedUntil[bundleID] = CFAbsoluteTimeGetCurrent() + 15.0
-                            }
-                        }
+        // 1. Current Space via AXUIElement
+        if TBIsAccessibilityTrusted(false) {
+            let appElem = AXUIElementCreateApplication(pid)
+            var windowsRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+               let windows = windowsRef as? [AXUIElement] {
+                for win in windows {
+                    var titleRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+                       let title = titleRef as? String, !title.isEmpty {
+                        titles.append(title)
                     }
                 }
             }
-            return false
         }
 
-        if status == OSStatus(errAEEventNotPermitted) {
-            deniedUntil[bundleID] = now + 15.0
+        // 2. All Spaces via CGWindowListCopyWindowInfo
+        if let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            for w in list {
+                guard let ownerPID = w[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid,
+                      let name = w[kCGWindowName as String] as? String, !name.isEmpty else { continue }
+                if !titles.contains(name) {
+                    titles.append(name)
+                }
+            }
         }
-        return false
+
+        return titles
     }
 
-    // Fallback: if Spotify Automation consent hasn't been clicked yet, read Spotify window title via AX!
-    private func fallbackSpotifyFromAX(runningApps: [NSRunningApplication]) -> NowPlayingState? {
-        guard TBIsAccessibilityTrusted(false),
-              let spotifyApp = runningApps.first(where: { $0.bundleIdentifier == "com.spotify.client" }) else {
+    private func fallbackSpotifyFromWindows(runningApps: [NSRunningApplication]) -> NowPlayingState? {
+        guard let spotifyApp = runningApps.first(where: { $0.bundleIdentifier == "com.spotify.client" }) else {
             return nil
         }
-        let titles = windowTitles(forPID: spotifyApp.processIdentifier)
         let icon = iconForApp(bundleID: "com.spotify.client")
-        for t in titles where !t.isEmpty && t != "Spotify" && t != "Spotify Free" && t != "Spotify Premium" {
-            // Spotify macOS window title format while playing is often "Artist - Track"
+        for t in allWindowTitles(forPID: spotifyApp.processIdentifier) {
+            if t == "Spotify" || t == "Spotify Free" || t == "Spotify Premium" { continue }
             let parts = t.components(separatedBy: " - ")
             let artist = parts.count >= 2 ? parts[0] : "Spotify"
             let title = parts.count >= 2 ? parts.dropFirst().joined(separator: " - ") : t
@@ -463,10 +564,7 @@ final class MediaController {
         return nil
     }
 
-    // MARK: - Accessibility Window Title Detection for Zen / Chrome / Safari / IINA
     private func detectBrowserOrPlayerWindowMedia(runningApps: [NSRunningApplication], frontmost: NSRunningApplication?) -> NowPlayingState? {
-        guard TBIsAccessibilityTrusted(false) else { return nil }
-
         let mediaAppHints = ["iina", "zen", "chrome", "safari", "firefox", "arc", "brave"]
         var candidates = runningApps.filter { app in
             guard let bid = app.bundleIdentifier?.lowercased() else { return false }
@@ -477,13 +575,11 @@ final class MediaController {
         }
 
         for app in candidates {
-            let appName = app.localizedName ?? "Browser"
             let rawBid = app.bundleIdentifier ?? ""
             let bid = rawBid.lowercased()
             let appIcon = !rawBid.isEmpty ? iconForApp(bundleID: rawBid) : nil
-            let titles = windowTitles(forPID: app.processIdentifier)
 
-            for rawTitle in titles {
+            for rawTitle in allWindowTitles(forPID: app.processIdentifier) {
                 if bid.contains("iina"), !rawTitle.isEmpty, rawTitle != "IINA" {
                     return NowPlayingState(
                         source: .universal,
@@ -500,7 +596,7 @@ final class MediaController {
                     )
                 }
 
-                if let parsed = parseMediaBrowserTitle(rawTitle, appName: appName) {
+                if let parsed = parseMediaBrowserTitle(rawTitle) {
                     return NowPlayingState(
                         source: .universal,
                         title: parsed.title,
@@ -520,25 +616,7 @@ final class MediaController {
         return nil
     }
 
-    private func windowTitles(forPID pid: pid_t) -> [String] {
-        let appElem = AXUIElementCreateApplication(pid)
-        var windowsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let windows = windowsRef as? [AXUIElement] else {
-            return []
-        }
-        var result: [String] = []
-        for win in windows {
-            var titleRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
-               let title = titleRef as? String, !title.isEmpty {
-                result.append(title)
-            }
-        }
-        return result
-    }
-
-    private func parseMediaBrowserTitle(_ raw: String, appName: String) -> (title: String, subtitle: String)? {
+    private func parseMediaBrowserTitle(_ raw: String) -> (title: String, subtitle: String)? {
         var cleaned = raw
         for suffix in [" — Zen Browser", " - Zen Browser", " — Mozilla Firefox", " - Google Chrome", " - Brave", " - Arc"] {
             if cleaned.hasSuffix(suffix) {
@@ -585,7 +663,7 @@ final class MediaController {
                bid.contains("vlc")
     }
 
-    // MARK: - Native Player Queries (In-Process NSAppleScript -> ~3ms!)
+    // MARK: - Direct In-Process NSAppleScript Queries (No AEDeterminePermission Deadlock!)
     private func querySpotify() -> NowPlayingState? {
         let script = """
         tell application "Spotify"
@@ -629,6 +707,13 @@ final class MediaController {
             appBundleID: "com.spotify.client",
             fetchedAt: Date()
         )
+    }
+
+    private func fetchSpotifyArtworkAsync(cacheKey: String) {
+        if let urlStr = runInProcessAppleScript("tell application \"Spotify\" to try\nreturn artwork url of current track\non error\nreturn \"\"\nend try"),
+           !urlStr.isEmpty {
+            _ = resolveArtwork(cacheKey: cacheKey, spotifyURL: urlStr, isMusic: false)
+        }
     }
 
     private func queryMusic() -> NowPlayingState? {
@@ -704,8 +789,6 @@ final class MediaController {
         )
     }
 
-    /// Fetches & downsamples album cover to a crisp 52x52px Retina thumbnail.
-    /// Apple Music artwork is read instantaneously from local memory; Spotify URL artwork downloads asynchronously so the UI never blocks!
     private func resolveArtwork(cacheKey: String, spotifyURL: String?, isMusic: Bool) -> NSImage? {
         if cacheKey == cachedArtworkKey {
             return cachedArtworkImage
@@ -732,7 +815,6 @@ final class MediaController {
             return thumb
         }
 
-        // Spotify: non-blocking async URL download -> refreshes Touch Bar as soon as cover arrives
         if let urlStr = spotifyURL, !urlStr.isEmpty, let url = URL(string: urlStr) {
             if artworkFetchInFlightKey != cacheKey {
                 artworkFetchInFlightKey = cacheKey
