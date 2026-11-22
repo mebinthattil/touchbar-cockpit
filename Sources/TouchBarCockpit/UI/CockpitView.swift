@@ -111,7 +111,7 @@ final class CockpitView: NSView {
         needsDisplay = true
     }
 
-    private func openMediaOverlayAndPause() {
+    private func openMediaOverlay(togglePlayback: Bool) {
         cancelLongPress()
         activeHUD = .media
         mediaPressedButton = nil
@@ -121,13 +121,20 @@ final class CockpitView: NSView {
         needsDisplay = true
         scheduleHUDDismiss(after: 8.0)
 
-        // Immediately toggle play/pause universally (works for Zen YouTube, Apple Music, Spotify, IINA)
-        MediaController.shared.togglePlayPause { [weak self] state in
+        let onState: (NowPlayingState) -> Void = { [weak self] state in
             guard let self = self else { return }
             self.mediaState = state
             if case .media = self.activeHUD {
                 self.needsDisplay = true
             }
+        }
+
+        if togglePlayback {
+            // Immediately toggle play/pause universally (works for Zen YouTube, Apple Music, Spotify, IINA)
+            MediaController.shared.togglePlayPause(completion: onState)
+        } else {
+            // Open media controls without pausing/toggling playback
+            MediaController.shared.fetchNowPlaying(completion: onState)
         }
 
         // Smooth live elapsed ticking while Media Overlay is visible
@@ -238,7 +245,7 @@ final class CockpitView: NSView {
                 guard let self = self else { return }
                 if case .pendingTap = self.gestureMode, self.peakTouchCount == 1 {
                     self.gestureMode = .longPressConsumed
-                    self.openMediaOverlayAndPause()
+                    self.openMediaOverlay(togglePlayback: true)
                 }
             }
             longPressWorkItem = work
@@ -675,7 +682,7 @@ final class CockpitView: NSView {
             let netFlags = flags.isEmpty ? "Direct (No VPN/Proxy)" : flags.joined(separator: " · ")
             showTransientToast(title: "NETWORK", detail: "↓ \(formatSpeed(metrics.netDownBps))   ↑ \(formatSpeed(metrics.netUpBps))   ·   \(netFlags)", accent: NSColor(calibratedRed: 0.65, green: 0.55, blue: 0.98, alpha: 1.0), duration: 3.0)
         } else if rects.clock.contains(point) {
-            onToggleKeepAwake?()
+            openMediaOverlay(togglePlayback: false)
         }
     }
 
