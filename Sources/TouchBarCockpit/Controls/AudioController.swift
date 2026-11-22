@@ -95,19 +95,18 @@ final class AudioController {
     }
 
     /// Fine-grained 1/64th native macOS HID volume step (triggers real macOS 27 HUD!)
-    func nudgeVolumeFine(steps: Int) -> Float {
-        guard steps != 0 else { return getVolume() }
+    func nudgeVolumeFine(steps: Int) {
+        guard steps != 0 else { return }
         if TBIsAccessibilityTrusted(false) {
             let key: Int32 = steps > 0 ? 0 : 1 // NX_KEYTYPE_SOUND_UP=0, SOUND_DOWN=1
-            let count = min(16, abs(steps))
+            let count = min(8, abs(steps))
             for _ in 0..<count {
                 TBPostAuxKey(key, true)
             }
-            return getVolume()
+            return
         }
         let next = max(0.0, min(1.0, getVolume() + Float(steps) / 64.0))
         setVolume(next, showOSD: true)
-        return next
     }
 
     func isMuted() -> Bool {

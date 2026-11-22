@@ -32,18 +32,17 @@ final class BrightnessController {
     }
 
     /// Fine-grained 1/64th native macOS HID brightness step (triggers real macOS 27 HUD!)
-    @discardableResult
-    func nudgeDisplayBrightnessFine(steps: Int) -> Float {
-        guard steps != 0 else { return getDisplayBrightness() }
+    func nudgeDisplayBrightnessFine(steps: Int) {
+        guard steps != 0 else { return }
         if TBIsAccessibilityTrusted(false) {
             let key: Int32 = steps > 0 ? 2 : 3 // NX_KEYTYPE_BRIGHTNESS_UP=2, DOWN=3
-            let count = min(16, abs(steps))
+            let count = min(8, abs(steps))
             for _ in 0..<count {
                 TBPostAuxKey(key, true)
             }
-            return getDisplayBrightness()
+            return
         }
-        return setDisplayBrightness(getDisplayBrightness() + Float(steps) / 64.0, showOSD: true)
+        _ = setDisplayBrightness(getDisplayBrightness() + Float(steps) / 64.0, showOSD: true)
     }
 
     func stepKeyboardBrightness(delta: Float) {

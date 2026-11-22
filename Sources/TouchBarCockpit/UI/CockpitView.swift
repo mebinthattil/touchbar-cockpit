@@ -36,11 +36,12 @@ final class CockpitView: NSView {
 
     // MARK: - Multi-Touch Gesture State
     private struct SliderTrackState {
-        var lastAvgX: CGFloat
-        var lastTouchCount: Int
-        var accumulatedPx: CGFloat = 0
-        var lastStepOffset: Int = 0
-        var startValue: Float
+        var touchXByID: [AnyHashable: CGFloat]
+        var visualValue: Float            // Continuous 0.0...1.0 for pixel-smooth 60 FPS Touch Bar fill
+        var stepCreditPx: CGFloat = 0     // Sub-step credit with reversal hysteresis
+        var lastStepDir: Int = 0          // -1, 0, +1 for reversal deadband
+        var settleUntil: TimeInterval = 0 // Brief settle window after finger-count change
+        var isAccessibilityTrusted: Bool
     }
 
     private enum GestureMode {
@@ -58,6 +59,8 @@ final class CockpitView: NSView {
     private var gestureMode: GestureMode = .idle
     private var peakTouchCount: Int = 0
     private var longPressWorkItem: DispatchWorkItem?
+    private var sliderSyncWorkItem: DispatchWorkItem?
+    private var sliderEaseTimer: Timer?
 
     // Live Audio Waveform State (Dynamic Island style in Clock slot)
     private var waveformBands: [Float] = Array(repeating: 0, count: AudioSpectrumTap.bandCount)
@@ -173,6 +176,13 @@ final class CockpitView: NSView {
         longPressWorkItem = nil
     }
 
+    private func cancelSliderSyncAndEase() {
+        sliderSyncWorkItem?.cancel()
+        sliderSyncWorkItem = nil
+        sliderEaseTimer?.invalidate()
+        sliderEaseTimer = nil
+    }
+
     private func dismissActiveHUD() {
         hudDismissTimer?.invalidate()
         hudDismissTimer = nil
@@ -180,6 +190,7 @@ final class CockpitView: NSView {
         mediaTickTimer = nil
         flashAnimTimer?.invalidate()
         flashAnimTimer = nil
+        cancelSliderSyncAndEase()
         mediaPressedButton = nil
         isScrubbingMedia = false
         isMediaOverlayPinned = false
@@ -362,16 +373,20 @@ final class CockpitView: NSView {
             let pt = active[0].location(in: self)
 
             // If Volume or Brightness slider HUD is already open, 1 finger immediately grabs it for fine control!
-            if case .volume = activeHUD {
+            if case .volume(let displayedVol, _) = activeHUD {
                 hudDismissTimer?.invalidate()
-                let curVol = AudioController.shared.getVolume()
-                gestureMode = .volumeSlide(SliderTrackState(lastAvgX: pt.x, lastTouchCount: 1, startValue: curVol))
+                let hadPendingSync = (sliderSyncWorkItem != nil || sliderEaseTimer != nil)
+                cancelSliderSyncAndEase()
+                let startVol = hadPendingSync ? displayedVol : AudioController.shared.getVolume()
+                gestureMode = .volumeSlide(makeSliderState(touches: active, initialValue: startVol, now: now))
                 return
             }
-            if case .brightness = activeHUD {
+            if case .brightness(let displayedBright) = activeHUD {
                 hudDismissTimer?.invalidate()
-                let curBright = BrightnessController.shared.getDisplayBrightness()
-                gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: pt.x, lastTouchCount: 1, startValue: curBright))
+                let hadPendingSync = (sliderSyncWorkItem != nil || sliderEaseTimer != nil)
+                cancelSliderSyncAndEase()
+                let startBright = hadPendingSync ? displayedBright : BrightnessController.shared.getDisplayBrightness()
+                gestureMode = .brightnessSlide(makeSliderState(touches: active, initialValue: startBright, now: now))
                 return
             }
 
@@ -452,13 +467,11 @@ final class CockpitView: NSView {
             // If already in a Brightness or Volume slide, smoothly re-anchor without resetting or jumping!
             switch gestureMode {
             case .brightnessSlide(var st):
-                st.lastAvgX = avgX
-                st.lastTouchCount = count
+                reanchorSliderState(&st, touches: active, now: now)
                 gestureMode = .brightnessSlide(st)
                 return
             case .volumeSlide(var st):
-                st.lastAvgX = avgX
-                st.lastTouchCount = count
+                reanchorSliderState(&st, touches: active, now: now)
                 gestureMode = .volumeSlide(st)
                 return
             default:
@@ -467,15 +480,14 @@ final class CockpitView: NSView {
             let curVol = AudioController.shared.getVolume()
             gestureMode = .twoFingerPending(startX: avgX, startTime: now, startVolume: curVol)
         } else if count >= 3 {
-            let avgX = averageX(active)
             if case .brightnessSlide(var st) = gestureMode {
-                st.lastAvgX = avgX
-                st.lastTouchCount = count
+                reanchorSliderState(&st, touches: active, now: now)
                 gestureMode = .brightnessSlide(st)
                 return
             }
+            cancelSliderSyncAndEase()
             let curBright = BrightnessController.shared.getDisplayBrightness()
-            gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: avgX, lastTouchCount: count, startValue: curBright))
+            gestureMode = .brightnessSlide(makeSliderState(touches: active, initialValue: curBright, now: now, settle: true))
             hudDismissTimer?.invalidate()
             mediaTickTimer?.invalidate()
             activeHUD = .brightness(value: curBright)
@@ -489,6 +501,8 @@ final class CockpitView: NSView {
         peakTouchCount = max(peakTouchCount, count)
         guard count > 0 else { return }
 
+        let now = ProcessInfo.processInfo.systemUptime
+
         if count >= 2 {
             cancelLongPress()
             mediaPressedButton = nil
@@ -500,15 +514,16 @@ final class CockpitView: NSView {
         switch gestureMode {
         case .pendingTap(let startPt, _):
             if count >= 3 {
+                cancelSliderSyncAndEase()
                 let b = BrightnessController.shared.getDisplayBrightness()
-                gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: avgX, lastTouchCount: count, startValue: b))
+                gestureMode = .brightnessSlide(makeSliderState(touches: active, initialValue: b, now: now, settle: true))
                 hudDismissTimer?.invalidate()
                 mediaTickTimer?.invalidate()
                 activeHUD = .brightness(value: b)
                 needsDisplay = true
             } else if count == 2 {
                 let v = AudioController.shared.getVolume()
-                gestureMode = .twoFingerPending(startX: avgX, startTime: ProcessInfo.processInfo.systemUptime, startVolume: v)
+                gestureMode = .twoFingerPending(startX: avgX, startTime: now, startVolume: v)
             } else if abs(avgX - startPt.x) > 22 {
                 cancelLongPress()
                 gestureMode = .idle
@@ -542,62 +557,55 @@ final class CockpitView: NSView {
             if count >= 2 {
                 mediaPressedButton = nil
                 let v = AudioController.shared.getVolume()
-                gestureMode = .twoFingerPending(startX: avgX, startTime: ProcessInfo.processInfo.systemUptime, startVolume: v)
+                gestureMode = .twoFingerPending(startX: avgX, startTime: now, startVolume: v)
             }
 
         case .longPressConsumed:
             break
 
-        case .twoFingerPending(let startX, _, let startVol):
+        case .twoFingerPending(let startX, let startTime, let startVol):
             if count >= 3 {
+                cancelSliderSyncAndEase()
                 let b = BrightnessController.shared.getDisplayBrightness()
-                gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: avgX, lastTouchCount: count, startValue: b))
-                hudDismissTimer?.invalidate()
-                mediaTickTimer?.invalidate()
-                activeHUD = .brightness(value: b)
-                needsDisplay = true
-            } else if abs(avgX - startX) > 4.0 {
-                var st = SliderTrackState(lastAvgX: avgX, lastTouchCount: count, accumulatedPx: avgX - startX, lastStepOffset: 0, startValue: startVol)
-                applyVolumeSlide(&st)
-                gestureMode = .volumeSlide(st)
-            }
-
-        case .volumeSlide(var st):
-            if count >= 3 {
-                let b = BrightnessController.shared.getDisplayBrightness()
-                gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: avgX, lastTouchCount: count, startValue: b))
+                gestureMode = .brightnessSlide(makeSliderState(touches: active, initialValue: b, now: now, settle: true))
                 hudDismissTimer?.invalidate()
                 mediaTickTimer?.invalidate()
                 activeHUD = .brightness(value: b)
                 needsDisplay = true
             } else {
-                if count != st.lastTouchCount {
-                    // Seamless finger-count handoff (e.g. 2 -> 1 finger): re-anchor with ZERO jump!
-                    st.lastAvgX = avgX
-                    st.lastTouchCount = count
-                } else {
-                    let rawDx = avgX - st.lastAvgX
-                    st.lastAvgX = avgX
-                    // Finer sensitivity when using 1 finger (0.65x) vs quick glide with 2 fingers (1.0x)
-                    let scale: CGFloat = (count == 1) ? 0.65 : 1.0
-                    st.accumulatedPx += rawDx * scale
-                    applyVolumeSlide(&st)
+                // Slightly higher threshold during the first 55ms so landing 3 fingers for Brightness
+                // never accidentally bumps Volume while finger 3 is still arriving.
+                let threshold: CGFloat = (now - startTime) < 0.055 ? 9.0 : 4.5
+                let initialDx = avgX - startX
+                if abs(initialDx) > threshold {
+                    cancelSliderSyncAndEase()
+                    var st = makeSliderState(touches: active, initialValue: startVol, now: now)
+                    applySliderDelta(initialDx, touchCount: count, isVolume: true, state: &st)
+                    gestureMode = .volumeSlide(st)
+                }
+            }
+
+        case .volumeSlide(var st):
+            if count >= 3 {
+                cancelSliderSyncAndEase()
+                let b = BrightnessController.shared.getDisplayBrightness()
+                gestureMode = .brightnessSlide(makeSliderState(touches: active, initialValue: b, now: now, settle: true))
+                hudDismissTimer?.invalidate()
+                mediaTickTimer?.invalidate()
+                activeHUD = .brightness(value: b)
+                needsDisplay = true
+            } else {
+                let rawDx = computeRobustDeltaX(touches: active, state: &st, now: now)
+                if rawDx != 0 {
+                    applySliderDelta(rawDx, touchCount: count, isVolume: true, state: &st)
                 }
                 gestureMode = .volumeSlide(st)
             }
 
         case .brightnessSlide(var st):
-            if count != st.lastTouchCount {
-                // Seamless finger-count handoff (e.g. 3 -> 2 -> 1 finger): re-anchor with ZERO jump!
-                st.lastAvgX = avgX
-                st.lastTouchCount = count
-            } else {
-                let rawDx = avgX - st.lastAvgX
-                st.lastAvgX = avgX
-                // Finer sensitivity when using 1 finger (0.65x) vs quick glide with 2-3 fingers (1.0x)
-                let scale: CGFloat = (count == 1) ? 0.65 : 1.0
-                st.accumulatedPx += rawDx * scale
-                applyBrightnessSlide(&st)
+            let rawDx = computeRobustDeltaX(touches: active, state: &st, now: now)
+            if rawDx != 0 {
+                applySliderDelta(rawDx, touchCount: count, isVolume: false, state: &st)
             }
             gestureMode = .brightnessSlide(st)
 
@@ -611,22 +619,20 @@ final class CockpitView: NSView {
         let now = ProcessInfo.processInfo.systemUptime
 
         // If some fingers lifted while others remain (e.g., 3 -> 1 or 2 -> 1),
-        // re-anchor centroid immediately so the remaining 1 finger continues with ZERO jump!
+        // re-anchor touch identities immediately with a brief settle window so there is ZERO jump!
         if !remaining.isEmpty {
-            let newAvgX = averageX(remaining)
             switch gestureMode {
             case .brightnessSlide(var st):
-                st.lastAvgX = newAvgX
-                st.lastTouchCount = remaining.count
+                reanchorSliderState(&st, touches: remaining, now: now)
                 gestureMode = .brightnessSlide(st)
             case .volumeSlide(var st):
-                st.lastAvgX = newAvgX
-                st.lastTouchCount = remaining.count
+                reanchorSliderState(&st, touches: remaining, now: now)
                 gestureMode = .volumeSlide(st)
             case .twoFingerPending(_, _, let startVol):
                 // User started with 2 fingers and dropped to 1 finger -> open Volume panel for 1-finger fine control!
                 if remaining.count == 1 {
-                    let st = SliderTrackState(lastAvgX: newAvgX, lastTouchCount: 1, startValue: startVol)
+                    cancelSliderSyncAndEase()
+                    let st = makeSliderState(touches: remaining, initialValue: startVol, now: now, settle: true)
                     gestureMode = .volumeSlide(st)
                     hudDismissTimer?.invalidate()
                     mediaTickTimer?.invalidate()
@@ -681,13 +687,19 @@ final class CockpitView: NSView {
                 let muted = AudioController.shared.toggleMute()
                 let vol = AudioController.shared.getVolume()
                 mediaTickTimer?.invalidate()
+                cancelSliderSyncAndEase()
                 activeHUD = .volume(value: vol, muted: muted)
                 scheduleHUDDismiss(after: 1.0)
                 needsDisplay = true
             }
 
-        case .volumeSlide, .brightnessSlide:
-            // Linger for 3.0s after last adjustment so you can put 1 finger right back down for fine tuning
+        case .volumeSlide:
+            // Reconcile once with hardware after HID queue settles, and linger 3.0s for 1F fine tuning
+            scheduleSliderHardwareSync(isVolume: true)
+            scheduleHUDDismiss(after: 3.0)
+
+        case .brightnessSlide:
+            scheduleSliderHardwareSync(isVolume: false)
             scheduleHUDDismiss(after: 3.0)
 
         case .idle:
@@ -702,8 +714,14 @@ final class CockpitView: NSView {
         cancelLongPress()
         mediaPressedButton = nil
         isScrubbingMedia = false
-        if case .volumeSlide = gestureMode { scheduleHUDDismiss(after: 3.0) }
-        if case .brightnessSlide = gestureMode { scheduleHUDDismiss(after: 3.0) }
+        if case .volumeSlide = gestureMode {
+            scheduleSliderHardwareSync(isVolume: true)
+            scheduleHUDDismiss(after: 3.0)
+        }
+        if case .brightnessSlide = gestureMode {
+            scheduleSliderHardwareSync(isVolume: false)
+            scheduleHUDDismiss(after: 3.0)
+        }
         gestureMode = .idle
         peakTouchCount = 0
     }
@@ -714,67 +732,271 @@ final class CockpitView: NSView {
         return sum / CGFloat(touches.count)
     }
 
-    private func applyVolumeSlide(_ st: inout SliderTrackState) {
-        hudDismissTimer?.invalidate()
-        mediaTickTimer?.invalidate()
+    private func touchKey(_ touch: NSTouch) -> AnyHashable {
+        if let obj = touch.identity as? NSObject {
+            return AnyHashable(obj)
+        }
+        return AnyHashable(ObjectIdentifier(touch.identity as AnyObject))
+    }
 
-        if TBIsAccessibilityTrusted(false) {
-            // 5.5pt per 1/64th fine native HID step (~350pt full sweep at 2F; ~540pt at 1F fine control!)
-            let targetOffset = Int(round(st.accumulatedPx / 5.5))
-            let diff = targetOffset - st.lastStepOffset
-            if diff != 0 {
-                _ = AudioController.shared.nudgeVolumeFine(steps: diff)
-                st.lastStepOffset = targetOffset
-                let approx = max(0.0, min(1.0, st.startValue + Float(targetOffset) / 64.0))
-                activeHUD = .volume(value: approx, muted: approx <= 0.004)
-                needsDisplay = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
-                    guard let self = self, case .volume = self.activeHUD else { return }
-                    self.activeHUD = .volume(value: AudioController.shared.getVolume(), muted: AudioController.shared.isMuted())
-                    self.needsDisplay = true
+    private func touchPositions(_ touches: [NSTouch]) -> [AnyHashable: CGFloat] {
+        var map: [AnyHashable: CGFloat] = [:]
+        map.reserveCapacity(touches.count)
+        for t in touches {
+            map[touchKey(t)] = t.location(in: self).x
+        }
+        return map
+    }
+
+    private func makeSliderState(touches: [NSTouch], initialValue: Float, now: TimeInterval, settle: Bool = false) -> SliderTrackState {
+        SliderTrackState(
+            touchXByID: touchPositions(touches),
+            visualValue: max(0.0, min(1.0, initialValue)),
+            stepCreditPx: 0,
+            lastStepDir: 0,
+            settleUntil: settle ? (now + 0.035) : 0,
+            isAccessibilityTrusted: TBIsAccessibilityTrusted(false)
+        )
+    }
+
+    private func reanchorSliderState(_ st: inout SliderTrackState, touches: [NSTouch], now: TimeInterval) {
+        st.touchXByID = touchPositions(touches)
+        st.stepCreditPx = 0
+        st.settleUntil = now + 0.035
+    }
+
+    /// Computes a glitch-free per-frame horizontal delta across persistent touch identities.
+    /// Eliminates finger-arrival/lift centroid jumps, rolling-finger spikes, and resting micro-jitter.
+    private func computeRobustDeltaX(touches: [NSTouch], state st: inout SliderTrackState, now: TimeInterval) -> CGFloat {
+        let prevCount = st.touchXByID.count
+        var nextPositions: [AnyHashable: CGFloat] = [:]
+        nextPositions.reserveCapacity(touches.count)
+        var deltas: [CGFloat] = []
+        deltas.reserveCapacity(touches.count)
+
+        for t in touches {
+            let key = touchKey(t)
+            let x = t.location(in: self).x
+            nextPositions[key] = x
+            if let prevX = st.touchXByID[key] {
+                let d = x - prevX
+                // Reject impossible single-frame capacitive lift/edge glitches (> 48pt in one frame)
+                if abs(d) <= 48.0 {
+                    deltas.append(d)
                 }
-            } else if case .none = activeHUD {
-                activeHUD = .volume(value: AudioController.shared.getVolume(), muted: AudioController.shared.isMuted())
-                needsDisplay = true
+            }
+        }
+        st.touchXByID = nextPositions
+
+        // Finger count changed -> absorb transition frame & settle briefly
+        if touches.count != prevCount {
+            st.stepCreditPx = 0
+            st.settleUntil = now + 0.035
+            return 0
+        }
+
+        if now < st.settleUntil || deltas.isEmpty {
+            return 0
+        }
+
+        let rawDx: CGFloat
+        if deltas.count == 1 {
+            rawDx = deltas[0]
+        } else if deltas.count == 2 {
+            let d0 = deltas[0]
+            let d1 = deltas[1]
+            if d0 * d1 < 0 && abs(d0 - d1) > 2.5 {
+                // Opposite-sign divergence happens when one finger rolls off while lifting -> ignore wobble
+                return 0
+            }
+            let a0 = abs(d0), a1 = abs(d1)
+            let hi = max(a0, a1), lo = min(a0, a1)
+            if hi > 4.0 && hi > lo * 3.0 {
+                // Single-finger roll outlier -> follow the steadier finger
+                rawDx = (a0 <= a1) ? d0 : d1
+            } else {
+                rawDx = (d0 + d1) * 0.5
             }
         } else {
-            let delta = Float(st.accumulatedPx / 320.0)
-            let target = max(0.0, min(1.0, st.startValue + delta))
-            AudioController.shared.setVolume(target, showOSD: true)
-            let muted = AudioController.shared.isMuted()
-            activeHUD = .volume(value: target, muted: muted)
+            // 3+ fingers: median completely ignores any single rolling/lifting finger!
+            let sorted = deltas.sorted()
+            rawDx = sorted[sorted.count / 2]
+        }
+
+        // Ignore sub-pixel capacitive shimmer when fingers are resting
+        return abs(rawDx) < 0.25 ? 0 : rawDx
+    }
+
+    private func applySliderDelta(_ rawDx: CGFloat, touchCount: Int, isVolume: Bool, state st: inout SliderTrackState) {
+        hudDismissTimer?.invalidate()
+        mediaTickTimer?.invalidate()
+        sliderEaseTimer?.invalidate()
+        sliderEaseTimer = nil
+
+        // Finer sensitivity with 1 finger (0.65x) vs quick glide with 2-3 fingers (1.0x)
+        let scale: CGFloat = (touchCount == 1) ? 0.65 : 1.0
+        let scaledDx = rawDx * scale
+
+        // 5.5pt per 1/64th fine native HID step (~352pt full 0-100% sweep at 2F/3F; ~541pt at 1F)
+        let stepPx: CGFloat = 5.5
+        let fullSweepPx: CGFloat = stepPx * 64.0
+        let reversalDeadband: CGFloat = 1.35
+
+        // Continuous pixel-smooth visual tracking (eliminates chunky 28px stair-steps on the OLED bar!)
+        let deltaFrac = Float(scaledDx / fullSweepPx)
+        let prevVisual = st.visualValue
+        st.visualValue = max(0.0, min(1.0, st.visualValue + deltaFrac))
+
+        if st.isAccessibilityTrusted {
+            st.stepCreditPx += scaledDx
+
+            // Boundary clamping: prevent accumulating unbounded credit past 0% or 100%,
+            // while still allowing final steps if hardware curve hasn't reached true 0% / 100% yet.
+            if st.visualValue <= 0.001 && st.stepCreditPx <= -stepPx {
+                let hwAtMin = isVolume
+                    ? (AudioController.shared.getVolume() <= 0.002 || AudioController.shared.isMuted())
+                    : (BrightnessController.shared.getDisplayBrightness() <= 0.002)
+                if hwAtMin {
+                    st.stepCreditPx = 0
+                }
+            } else if st.visualValue >= 0.999 && st.stepCreditPx >= stepPx {
+                let hwAtMax = isVolume
+                    ? (AudioController.shared.getVolume() >= 0.998)
+                    : (BrightnessController.shared.getDisplayBrightness() >= 0.998)
+                if hwAtMax {
+                    st.stepCreditPx = 0
+                }
+            }
+
+            // Hysteresis step emitter: requires 1.35x threshold on direction reversal to prevent +1/-1 chatter
+            var stepsToEmit = 0
+            let maxStepsPerFrame = 6
+
+            while stepsToEmit < maxStepsPerFrame {
+                let thresh = (st.lastStepDir < 0) ? (stepPx * reversalDeadband) : stepPx
+                if st.stepCreditPx >= thresh {
+                    st.stepCreditPx -= stepPx
+                    st.lastStepDir = 1
+                    stepsToEmit += 1
+                } else {
+                    break
+                }
+            }
+            while stepsToEmit > -maxStepsPerFrame {
+                let thresh = (st.lastStepDir > 0) ? (stepPx * reversalDeadband) : stepPx
+                if st.stepCreditPx <= -thresh {
+                    st.stepCreditPx += stepPx
+                    st.lastStepDir = -1
+                    stepsToEmit -= 1
+                } else {
+                    break
+                }
+            }
+
+            if stepsToEmit != 0 {
+                if isVolume {
+                    AudioController.shared.nudgeVolumeFine(steps: stepsToEmit)
+                } else {
+                    BrightnessController.shared.nudgeDisplayBrightnessFine(steps: stepsToEmit)
+                }
+            }
+
+            if isVolume {
+                activeHUD = .volume(value: st.visualValue, muted: st.visualValue <= 0.004)
+            } else {
+                activeHUD = .brightness(value: st.visualValue)
+            }
+            if abs(st.visualValue - prevVisual) > 0.0004 || stepsToEmit != 0 {
+                needsDisplay = true
+            }
+
+            // Debounced single hardware sync (only fires 160ms AFTER movement stops — never fights live drag!)
+            scheduleSliderHardwareSync(isVolume: isVolume)
+        } else {
+            if isVolume {
+                AudioController.shared.setVolume(st.visualValue, showOSD: true)
+                activeHUD = .volume(value: st.visualValue, muted: AudioController.shared.isMuted())
+            } else {
+                let target = BrightnessController.shared.setDisplayBrightness(st.visualValue, showOSD: true)
+                st.visualValue = target
+                activeHUD = .brightness(value: target)
+            }
             needsDisplay = true
         }
     }
 
-    private func applyBrightnessSlide(_ st: inout SliderTrackState) {
-        hudDismissTimer?.invalidate()
-        mediaTickTimer?.invalidate()
+    /// Reconciles the Touch Bar slider with the true hardware value ONCE after the user pauses or lifts,
+    /// using a silky 90ms ease so tiny HID curve differences settle invisibly with zero snap-back.
+    private func scheduleSliderHardwareSync(isVolume: Bool) {
+        sliderSyncWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.sliderSyncWorkItem = nil
 
-        if TBIsAccessibilityTrusted(false) {
-            let targetOffset = Int(round(st.accumulatedPx / 5.5))
-            let diff = targetOffset - st.lastStepOffset
-            if diff != 0 {
-                _ = BrightnessController.shared.nudgeDisplayBrightnessFine(steps: diff)
-                st.lastStepOffset = targetOffset
-                let approx = max(0.0, min(1.0, st.startValue + Float(targetOffset) / 64.0))
-                activeHUD = .brightness(value: approx)
-                needsDisplay = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
-                    guard let self = self, case .brightness = self.activeHUD else { return }
-                    self.activeHUD = .brightness(value: BrightnessController.shared.getDisplayBrightness())
-                    self.needsDisplay = true
+            let hwVal: Float
+            let hwMuted: Bool
+            let currentDisplayed: Float
+
+            if isVolume {
+                guard case .volume(let cur, _) = self.activeHUD else { return }
+                currentDisplayed = cur
+                hwVal = AudioController.shared.getVolume()
+                hwMuted = AudioController.shared.isMuted()
+                if case .volumeSlide(var st) = self.gestureMode {
+                    st.visualValue = hwVal
+                    st.stepCreditPx = 0
+                    self.gestureMode = .volumeSlide(st)
                 }
-            } else if case .none = activeHUD {
-                activeHUD = .brightness(value: BrightnessController.shared.getDisplayBrightness())
-                needsDisplay = true
+            } else {
+                guard case .brightness(let cur) = self.activeHUD else { return }
+                currentDisplayed = cur
+                hwVal = BrightnessController.shared.getDisplayBrightness()
+                hwMuted = false
+                if case .brightnessSlide(var st) = self.gestureMode {
+                    st.visualValue = hwVal
+                    st.stepCreditPx = 0
+                    self.gestureMode = .brightnessSlide(st)
+                }
             }
-        } else {
-            let delta = Float(st.accumulatedPx / 320.0)
-            let target = BrightnessController.shared.setDisplayBrightness(st.startValue + delta, showOSD: true)
-            activeHUD = .brightness(value: target)
-            needsDisplay = true
+
+            if abs(hwVal - currentDisplayed) <= 0.008 || hwMuted {
+                self.activeHUD = isVolume ? .volume(value: hwVal, muted: hwMuted) : .brightness(value: hwVal)
+                self.needsDisplay = true
+                return
+            }
+
+            // Smooth 90ms ease (6 steps @ ~66Hz) to reconcile any tiny non-linear HID curve offset
+            self.sliderEaseTimer?.invalidate()
+            let totalSteps = 6
+            var step = 0
+            let startVal = currentDisplayed
+            let timer = Timer(timeInterval: 0.015, repeats: true) { [weak self] t in
+                guard let self = self else { t.invalidate(); return }
+                step += 1
+                let progress = min(1.0, Float(step) / Float(totalSteps))
+                // Ease-out quadratic
+                let eased = 1.0 - (1.0 - progress) * (1.0 - progress)
+                let val = startVal + (hwVal - startVal) * eased
+
+                if isVolume {
+                    guard case .volume = self.activeHUD else { t.invalidate(); self.sliderEaseTimer = nil; return }
+                    self.activeHUD = .volume(value: val, muted: hwMuted)
+                } else {
+                    guard case .brightness = self.activeHUD else { t.invalidate(); self.sliderEaseTimer = nil; return }
+                    self.activeHUD = .brightness(value: val)
+                }
+                self.needsDisplay = true
+
+                if step >= totalSteps {
+                    t.invalidate()
+                    self.sliderEaseTimer = nil
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.sliderEaseTimer = timer
         }
+        sliderSyncWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16, execute: work)
     }
 
     private func handleMediaButton(_ button: MediaButton) {
