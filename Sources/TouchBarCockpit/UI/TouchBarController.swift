@@ -80,6 +80,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         cockpitView.update(metrics: metrics)
     }
 
+    func updateWaveform(bands: [Float], isActive: Bool) {
+        cockpitView.updateWaveform(bands: bands, isActive: isActive)
+    }
+
     // MARK: - NSTouchBarDelegate
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         guard identifier == Self.itemIdentifier else { return nil }

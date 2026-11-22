@@ -47,11 +47,13 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>14.2</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>TouchBarCockpit reads Now Playing track info and controls playback/scrubbing in Spotify, Music, and VLC.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>TouchBarCockpit analyzes system audio output to render a live minimal Dynamic Island-style waveform on your Touch Bar while media is playing.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

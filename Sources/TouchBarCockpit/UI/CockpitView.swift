@@ -54,6 +54,10 @@ final class CockpitView: NSView {
     private var peakTouchCount: Int = 0
     private var longPressWorkItem: DispatchWorkItem?
 
+    // Live Audio Waveform State (Dynamic Island style in Clock slot)
+    private var waveformBands: [Float] = Array(repeating: 0, count: AudioSpectrumTap.bandCount)
+    private var isAudioPlaying: Bool = false
+
     // Callbacks
     var onToggleKeepAwake: (() -> Void)?
     var onOpenFanControl: (() -> Void)?
@@ -77,6 +81,15 @@ final class CockpitView: NSView {
     func update(metrics: SystemMetrics) {
         self.metrics = metrics
         needsDisplay = true
+    }
+
+    func updateWaveform(bands: [Float], isActive: Bool) {
+        self.waveformBands = bands
+        self.isAudioPlaying = isActive
+        // Fast-path: only dirty the tiny 85x30pt waveform slot when cockpit is visible!
+        if case .none = activeHUD {
+            setNeedsDisplay(panelRects(for: bounds).clock)
+        }
     }
 
     func showTransientToast(title: String, detail: String, accent: NSColor = .systemCyan, duration: TimeInterval = 3.0) {
@@ -721,9 +734,9 @@ final class CockpitView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
-        // Pure OLED Black Background
+        // Pure OLED Black Background (clipped to dirtyRect for fast partial redraws)
         ctx.setFillColor(NSColor.black.cgColor)
-        ctx.fill(bounds)
+        ctx.fill(dirtyRect)
 
         switch activeHUD {
         case .volume(let value, let muted):
@@ -758,25 +771,32 @@ final class CockpitView: NSView {
             break
         }
 
-        // Draw 6-Panel Info-Dense Cockpit
+        // Draw 6-Panel Info-Dense Cockpit (skip panels outside dirtyRect for ultra-low 20 FPS waveform CPU)
         let rects = panelRects(for: bounds)
 
-        drawCPUPanel(ctx: ctx, rect: rects.cpu)
-        drawDivider(ctx: ctx, x: rects.cpu.maxX, height: bounds.height)
-
-        drawRAMPanel(ctx: ctx, rect: rects.ram)
-        drawDivider(ctx: ctx, x: rects.ram.maxX, height: bounds.height)
-
-        drawThermalPanel(ctx: ctx, rect: rects.thermal)
-        drawDivider(ctx: ctx, x: rects.thermal.maxX, height: bounds.height)
-
-        drawPowerPanel(ctx: ctx, rect: rects.power)
-        drawDivider(ctx: ctx, x: rects.power.maxX, height: bounds.height)
-
-        drawNetworkPanel(ctx: ctx, rect: rects.network)
-        drawDivider(ctx: ctx, x: rects.network.maxX, height: bounds.height)
-
-        drawClockPanel(ctx: ctx, rect: rects.clock)
+        if dirtyRect.intersects(rects.cpu) {
+            drawCPUPanel(ctx: ctx, rect: rects.cpu)
+            drawDivider(ctx: ctx, x: rects.cpu.maxX, height: bounds.height)
+        }
+        if dirtyRect.intersects(rects.ram) {
+            drawRAMPanel(ctx: ctx, rect: rects.ram)
+            drawDivider(ctx: ctx, x: rects.ram.maxX, height: bounds.height)
+        }
+        if dirtyRect.intersects(rects.thermal) {
+            drawThermalPanel(ctx: ctx, rect: rects.thermal)
+            drawDivider(ctx: ctx, x: rects.thermal.maxX, height: bounds.height)
+        }
+        if dirtyRect.intersects(rects.power) {
+            drawPowerPanel(ctx: ctx, rect: rects.power)
+            drawDivider(ctx: ctx, x: rects.power.maxX, height: bounds.height)
+        }
+        if dirtyRect.intersects(rects.network) {
+            drawNetworkPanel(ctx: ctx, rect: rects.network)
+            drawDivider(ctx: ctx, x: rects.network.maxX, height: bounds.height)
+        }
+        if dirtyRect.intersects(rects.clock) {
+            drawClockPanel(ctx: ctx, rect: rects.clock)
+        }
     }
 
     // MARK: - Divider
@@ -1043,8 +1063,13 @@ final class CockpitView: NSView {
         drawSparkline(ctx: ctx, values: metrics.netUpHistory, maxValue: peakVal, rect: sparkRect, strokeColor: upColor, fillAlpha: 0.14)
     }
 
-    // MARK: - Panel 6: Clock + Keep-Awake Indicator
+    // MARK: - Panel 6: Live Dynamic Island Audio Waveform (when playing) or Clock (when idle)
     private func drawClockPanel(ctx: CGContext, rect: NSRect) {
+        if isAudioPlaying {
+            drawDynamicIslandWaveform(ctx: ctx, rect: rect)
+            return
+        }
+
         let df = DateFormatter()
         df.dateFormat = "HH:mm"
         let hm = df.string(from: metrics.timestamp)
@@ -1065,6 +1090,52 @@ final class CockpitView: NSView {
             let dayStr = dayDf.string(from: metrics.timestamp).uppercased()
             drawTextCentered(dayStr, centerX: centerX, y: 3.0, size: 7.5, weight: .medium, color: NSColor(calibratedWhite: 0.48, alpha: 1.0))
         }
+    }
+
+    private func drawDynamicIslandWaveform(ctx: CGContext, rect: NSRect) {
+        let count = waveformBands.count
+        guard count > 0 else { return }
+
+        let barW: CGFloat = 4.5
+        let gap: CGFloat = 4.5
+        let totalW = CGFloat(count) * barW + CGFloat(count - 1) * gap
+        let startX = rect.midX - totalW / 2.0
+        let midY = rect.midY
+        let minH: CGFloat = 4.5
+        let maxH: CGFloat = 22.0
+
+        // Dynamic Island-inspired vivid OLED spectrum gradient (cyan -> teal -> emerald -> sky -> violet)
+        let palette: [NSColor] = [
+            NSColor(calibratedRed: 0.22, green: 0.74, blue: 0.97, alpha: 1.0),
+            NSColor(calibratedRed: 0.13, green: 0.83, blue: 0.93, alpha: 1.0),
+            NSColor(calibratedRed: 0.18, green: 0.84, blue: 0.75, alpha: 1.0),
+            NSColor(calibratedRed: 0.20, green: 0.85, blue: 0.58, alpha: 1.0),
+            NSColor(calibratedRed: 0.38, green: 0.65, blue: 0.98, alpha: 1.0),
+            NSColor(calibratedRed: 0.65, green: 0.54, blue: 0.98, alpha: 1.0)
+        ]
+
+        ctx.saveGState()
+        for i in 0..<count {
+            let level = CGFloat(min(1.0, max(0.0, waveformBands[i])))
+            let h = minH + level * (maxH - minH)
+            let x = startX + CGFloat(i) * (barW + gap)
+            let y = midY - h / 2.0
+            let barRect = CGRect(x: x, y: y, width: barW, height: h)
+            let path = CGPath(roundedRect: barRect, cornerWidth: barW / 2.0, cornerHeight: barW / 2.0, transform: nil)
+            let baseColor = palette[i % palette.count]
+            // Subtle brightness modulation with amplitude so beats pop on OLED
+            let alpha = 0.55 + 0.45 * level
+            ctx.setFillColor(baseColor.withAlphaComponent(alpha).cgColor)
+            ctx.addPath(path)
+            ctx.fillPath()
+        }
+
+        // Tiny amber dot in top-right corner if Keep Awake is active
+        if metrics.keepAwakeActive {
+            ctx.setFillColor(NSColor(calibratedRed: 0.99, green: 0.72, blue: 0.22, alpha: 1.0).cgColor)
+            ctx.fillEllipse(in: CGRect(x: rect.maxX - 9, y: rect.maxY - 8, width: 4, height: 4))
+        }
+        ctx.restoreGState()
     }
 
     // MARK: - Full-Width OLED Gesture HUD (Volume / Brightness)

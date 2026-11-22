@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "TouchBarCockpit",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .executable(name: "TouchBarCockpit", targets: ["TouchBarCockpit"])
@@ -29,7 +29,8 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("IOKit"),
                 .linkedFramework("CoreAudio"),
-                .linkedFramework("CoreGraphics")
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("Accelerate")
             ]
         )
     ]

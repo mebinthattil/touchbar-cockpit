@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let thermalSampler = ThermalSampler()
     private let powerSampler = PowerSampler()
     private let networkSampler = NetworkSampler()
+    private let audioSpectrumTap = AudioSpectrumTap()
 
     private var metrics = SystemMetrics()
     private var telemetryTimer: Timer?
@@ -36,6 +37,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupSystemObservers()
         setupFnKeyMonitor()
 
+        audioSpectrumTap.onUpdate = { [weak self] bands, isActive in
+            self?.touchBarController.updateWaveform(bands: bands, isActive: isActive)
+        }
+
         // Initial sample + present Touch Bar
         sampleMetrics(includeSlowSensors: true)
         touchBarController.present()
@@ -52,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         telemetryTimer?.invalidate()
         fnPollTimer?.invalidate()
+        audioSpectrumTap.stop()
         if let m = globalFlagsMonitor { NSEvent.removeMonitor(m) }
         if let m = localFlagsMonitor { NSEvent.removeMonitor(m) }
         if let m = globalKeyMonitor { NSEvent.removeMonitor(m) }
@@ -118,6 +124,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         metrics.timestamp = Date()
 
         touchBarController.update(metrics: metrics)
+        if !isPaused {
+            audioSpectrumTap.checkOutputActivity()
+        }
         updateMenuSummary()
     }
 
@@ -192,10 +201,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let ws = NSWorkspace.shared.notificationCenter
         let reattachSelector = #selector(handleSystemWake)
 
+        ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.willSleepNotification, object: nil)
         ws.addObserver(self, selector: reattachSelector, name: NSWorkspace.didWakeNotification, object: nil)
         ws.addObserver(self, selector: reattachSelector, name: NSWorkspace.screensDidWakeNotification, object: nil)
         ws.addObserver(self, selector: reattachSelector, name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: reattachSelector, name: NSApplication.didChangeScreenParametersNotification, object: nil)
+    }
+
+    @objc private func handleSystemSleep() {
+        audioSpectrumTap.stop()
     }
 
     @objc private func handleSystemWake() {
@@ -303,10 +317,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePause() {
         isPaused.toggle()
         if isPaused {
+            audioSpectrumTap.stop()
             touchBarController.dismiss()
             pauseMenuItem.title = "Resume Cockpit"
         } else {
             touchBarController.present()
+            audioSpectrumTap.checkOutputActivity()
             pauseMenuItem.title = "Pause (Restore Native Bar)"
         }
     }
