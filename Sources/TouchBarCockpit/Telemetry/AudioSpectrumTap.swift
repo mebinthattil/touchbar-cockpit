@@ -2,7 +2,7 @@ import Foundation
 import CoreAudio
 import AudioToolbox
 import Accelerate
-import os
+import CPrivateAPIs
 
 /// Ultra-lightweight native macOS 14.2+ CoreAudio Process Tap + 512-pt vDSP FFT
 /// Produces 6 real-time frequency bands (Dynamic Island style) with ZERO virtual drivers
@@ -21,8 +21,10 @@ final class AudioSpectrumTap {
     private var aggregateDeviceID: AudioObjectID = kAudioObjectUnknown
     private var ioProcID: AudioDeviceIOProcID?
     private var isTapRunning: Bool = false
+    private var activeOutputDeviceID: AudioDeviceID = 0
+    private let ioQueue = DispatchQueue(label: "com.mebin.touchbarcockpit.audiotap", qos: .userInteractive)
 
-    // Lock-free audio ring buffer (written on real-time audio thread, read on main timer)
+    // Lock-free audio ring buffer (ARM64 release/acquire atomic cursor)
     private let ringBuffer: UnsafeMutablePointer<Float>
     private var ringWriteIndex = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
 
@@ -33,6 +35,16 @@ final class AudioSpectrumTap {
     private var realBuf: [Float]
     private var imagBuf: [Float]
     private var magnitudes: [Float]
+    private var rawBands: [Float] = Array(repeating: 0, count: bandCount)
+
+    private static let binRanges: [(ClosedRange<Int>, Float)] = [
+        (1...2,    0.85),  // Sub-bass / kick
+        (3...5,    1.00),  // Bass
+        (6...11,   1.30),  // Low-mid / vocals
+        (12...24,  1.75),  // Mid / melody
+        (25...52,  2.35),  // Presence
+        (53...120, 3.10)   // Brilliance / hi-hats
+    ]
 
     // Smoothing & silence hysteresis
     private var smoothedBands: [Float] = Array(repeating: 0, count: bandCount)
@@ -40,6 +52,7 @@ final class AudioSpectrumTap {
     private var rollingPeak: Float = 0.08
     private var lastSoundTime: CFAbsoluteTime = 0
     private(set) var isAudioActive: Bool = false
+    private var isTimerInFastMode: Bool = false
     private var uiTimer: Timer?
 
     init() {
@@ -68,17 +81,23 @@ final class AudioSpectrumTap {
         ringWriteIndex.deallocate()
     }
 
-    // MARK: - Smart Idle-Gated Poll (Call at 1 Hz from AppDelegate)
+    // MARK: - Smart Idle-Gated Poll (Handles output device switches like Speakers <-> AirPods cleanly!)
     func checkOutputActivity() {
-        let outputRunning = Self.isDefaultOutputRunningSomewhere()
+        let (devID, outputRunning) = Self.defaultOutputStatus()
         if outputRunning {
+            if isTapRunning && devID != 0 && activeOutputDeviceID != 0 && devID != activeOutputDeviceID {
+                // Default output device switched (e.g. connected AirPods) -> cleanly restart tap
+                stop()
+            }
             if !isTapRunning {
+                activeOutputDeviceID = devID
                 start()
             }
         } else {
             if isTapRunning || isAudioActive {
                 stop()
             }
+            activeOutputDeviceID = 0
         }
     }
 
@@ -128,23 +147,21 @@ final class AudioSpectrumTap {
 
         // Reset ring buffer
         ringBuffer.update(repeating: 0, count: Self.ringMask + 1)
-        ringWriteIndex.pointee = 0
+        TBAtomicStoreInt32(ringWriteIndex, 0)
 
-        // 3. Attach real-time lock-free IOProc
+        // 3. Attach real-time lock-free IOProc (ARM64 release/acquire memory ordering)
         let bufPtr = ringBuffer
         let idxPtr = ringWriteIndex
         let mask = Self.ringMask
-        let ioQueue = DispatchQueue(label: "com.mebin.touchbarcockpit.audiotap", qos: .userInteractive)
 
         var newProcID: AudioDeviceIOProcID?
         let procStatus = AudioDeviceCreateIOProcIDWithBlock(&newProcID, aggregateDeviceID, ioQueue) { _, inInputData, _, _, _ in
             let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
             guard !abl.isEmpty else { return }
 
-            var writeIdx = Int(idxPtr.pointee)
+            var writeIdx = Int(TBAtomicLoadInt32(idxPtr))
 
             if abl.count == 1 {
-                // Interleaved stereo or mono Float32
                 let b = abl[0]
                 guard let raw = b.mData else { return }
                 let channels = max(1, Int(b.mNumberChannels))
@@ -166,7 +183,6 @@ final class AudioSpectrumTap {
                     }
                 }
             } else {
-                // Non-interleaved (planar) stereo Float32
                 guard let rawL = abl[0].mData, let rawR = abl[1].mData else { return }
                 let frameCount = Int(abl[0].mDataByteSize) / MemoryLayout<Float>.stride
                 let samplesL = rawL.assumingMemoryBound(to: Float.self)
@@ -177,7 +193,7 @@ final class AudioSpectrumTap {
                 }
             }
 
-            idxPtr.pointee = Int32(truncatingIfNeeded: writeIdx)
+            TBAtomicStoreInt32(idxPtr, Int32(truncatingIfNeeded: writeIdx))
         }
 
         guard procStatus == noErr, let procID = newProcID else {
@@ -193,18 +209,20 @@ final class AudioSpectrumTap {
         }
 
         isTapRunning = true
-        startUITimer()
+        setUITimerCadence(fast: true)
     }
 
     func stop() {
         uiTimer?.invalidate()
         uiTimer = nil
+        isTimerInFastMode = false
         teardownAudioHandles()
         isTapRunning = false
 
         let wasActive = isAudioActive
         isAudioActive = false
         smoothedBands = Array(repeating: 0, count: Self.bandCount)
+        lastEmittedBands = Array(repeating: -1, count: Self.bandCount)
         if wasActive {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -231,13 +249,16 @@ final class AudioSpectrumTap {
         }
     }
 
-    // MARK: - 15 FPS FFT Analysis (Coalesced timer, only runs while output stream is active)
-    private func startUITimer() {
+    // MARK: - Adaptive FFT Analysis (15 FPS while playing, drops to 2 Hz when paused/silent!)
+    private func setUITimerCadence(fast: Bool) {
+        if uiTimer != nil && isTimerInFastMode == fast { return }
         uiTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.066, repeats: true) { [weak self] _ in
+        isTimerInFastMode = fast
+        let interval: TimeInterval = fast ? 0.066 : 0.5
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             self?.analyzeFrame()
         }
-        timer.tolerance = 0.012
+        timer.tolerance = fast ? 0.012 : 0.1
         RunLoop.main.add(timer, forMode: .common)
         uiTimer = timer
     }
@@ -245,8 +266,8 @@ final class AudioSpectrumTap {
     private func analyzeFrame() {
         guard isTapRunning, let setup = fftSetup else { return }
 
-        // 1. Copy latest 512 samples from ring buffer
-        let endIdx = Int(ringWriteIndex.pointee)
+        // 1. Copy latest 512 samples from ring buffer (ARM64 acquire load)
+        let endIdx = Int(TBAtomicLoadInt32(ringWriteIndex))
         let n = Self.fftSize
         let mask = Self.ringMask
         let startIdx = endIdx &- n
@@ -262,6 +283,9 @@ final class AudioSpectrumTap {
         let hasSignal = rms > 0.0016
         if hasSignal {
             lastSoundTime = now
+            if !isTimerInFastMode {
+                setUITimerCadence(fast: true)
+            }
         }
 
         let shouldBeActive = hasSignal || (now - lastSoundTime) < 1.25
@@ -270,7 +294,11 @@ final class AudioSpectrumTap {
             if isAudioActive {
                 isAudioActive = false
                 smoothedBands = Array(repeating: 0, count: Self.bandCount)
+                lastEmittedBands = Array(repeating: -1, count: Self.bandCount)
                 onUpdate?(smoothedBands, false)
+            }
+            if isTimerInFastMode {
+                setUITimerCadence(fast: false)
             }
             return
         }
@@ -298,21 +326,10 @@ final class AudioSpectrumTap {
         var scale = Float(1.0 / Float(n))
         vDSP_vsmul(magnitudes, 1, &scale, &magnitudes, 1, vDSP_Length(halfN))
 
-        // 4. Aggregate into 6 musical log-spaced frequency bands (Dynamic Island style)
-        // At 48kHz / 512pt FFT -> ~93.75 Hz per bin
-        let binRanges: [(ClosedRange<Int>, Float)] = [
-            (1...2,    0.85),  // Sub-bass / kick
-            (3...5,    1.00),  // Bass
-            (6...11,   1.30),  // Low-mid / vocals
-            (12...24,  1.75),  // Mid / melody
-            (25...52,  2.35),  // Presence
-            (53...120, 3.10)   // Brilliance / hi-hats
-        ]
-
-        var rawBands = [Float](repeating: 0, count: Self.bandCount)
+        // 4. Aggregate into 6 musical log-spaced frequency bands (zero per-frame allocations!)
         var frameMax: Float = 0.001
 
-        for (i, (range, weight)) in binRanges.enumerated() {
+        for (i, (range, weight)) in Self.binRanges.enumerated() {
             var sum: Float = 0
             var cnt: Float = 0
             for b in range where b < halfN {
@@ -336,7 +353,6 @@ final class AudioSpectrumTap {
             let norm = min(1.0, max(0.0, powf(rawBands[i] / max(0.025, rollingPeak * 1.15), 0.72)))
             let target = hasSignal ? norm : 0.0
             let prev = smoothedBands[i]
-            // Fast attack (0.62), smooth natural decay (0.30) tuned for 15 FPS
             let alpha: Float = target > prev ? 0.62 : 0.30
             let next = prev + (target - prev) * alpha
             smoothedBands[i] = next
@@ -351,8 +367,8 @@ final class AudioSpectrumTap {
         }
     }
 
-    // MARK: - CoreAudio Output Activity Check (0.001% CPU!)
-    private static func isDefaultOutputRunningSomewhere() -> Bool {
+    // MARK: - CoreAudio Output Activity & Device ID Check (0.001% CPU!)
+    private static func defaultOutputStatus() -> (deviceID: AudioDeviceID, isRunning: Bool) {
         var dev = AudioDeviceID(0)
         var devSize = UInt32(MemoryLayout<AudioDeviceID>.size)
         var devAddr = AudioObjectPropertyAddress(
@@ -368,7 +384,7 @@ final class AudioSpectrumTap {
             &devSize,
             &dev
         ) == noErr, dev != 0 else {
-            return false
+            return (0, false)
         }
 
         var running: UInt32 = 0
@@ -379,8 +395,8 @@ final class AudioSpectrumTap {
             mElement: kAudioObjectPropertyElementMain
         )
         guard AudioObjectGetPropertyData(dev, &runAddr, 0, nil, &runSize, &running) == noErr else {
-            return false
+            return (dev, false)
         }
-        return running != 0
+        return (dev, running != 0)
     }
 }

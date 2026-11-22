@@ -37,10 +37,17 @@ void TBShowBrightnessOSD(float brightness);
 void TBShowKeyboardBrightnessOSD(float brightness);
 
 // MARK: - Apple Silicon Thermal (IOHIDEventSystemClient)
-/// Returns average SoC die temperature in Celsius (negative if unavailable)
-double TBReadSoCTemperature(void);
-/// Returns peak SoC die temperature in Celsius (negative if unavailable)
-double TBReadSoCPeakTemperature(void);
+typedef struct {
+    double avgTempC;
+    double peakTempC;
+} TBThermalInfo;
+
+/// Single-pass cached M2 SoC die temperature read (avg & peak in Celsius, negative if unavailable)
+TBThermalInfo TBReadThermalInfo(void);
+
+// MARK: - Lock-Free ARM64 Atomics for Audio Ring Buffer
+void TBAtomicStoreInt32(int32_t *ptr, int32_t value);
+int32_t TBAtomicLoadInt32(const int32_t *ptr);
 
 // MARK: - AppleSMC Fan Telemetry
 typedef struct {

@@ -89,9 +89,9 @@ final class MediaController {
         let playerState = (info["Player State"] as? String ?? "").lowercased()
         let title = info["Name"] as? String ?? ""
         let artist = info["Artist"] as? String ?? ""
-        // Spotify broadcasts Duration in milliseconds and Playback Position in seconds
+        // Spotify broadcasts Duration in seconds (only convert if unexpectedly in ms > 24h)
         let rawDur = (info["Duration"] as? NSNumber)?.doubleValue ?? 0
-        let dur = rawDur > 3600 ? (rawDur / 1000.0) : rawDur
+        let dur = rawDur > 86400 ? (rawDur / 1000.0) : rawDur
         let pos = (info["Playback Position"] as? NSNumber)?.doubleValue ?? 0
         let isPlaying = (playerState == "playing")
 
@@ -139,9 +139,9 @@ final class MediaController {
         let playerState = (info["Player State"] as? String ?? "").lowercased()
         let title = info["Name"] as? String ?? ""
         let artist = info["Artist"] as? String ?? ""
-        // Apple Music broadcasts Total Time in milliseconds
+        // Apple Music always broadcasts Total Time in milliseconds
         let rawDur = (info["Total Time"] as? NSNumber)?.doubleValue ?? 0
-        let dur = rawDur > 3600 ? (rawDur / 1000.0) : rawDur
+        let dur = rawDur / 1000.0
         let isPlaying = (playerState == "playing")
 
         queue.async { [weak self] in

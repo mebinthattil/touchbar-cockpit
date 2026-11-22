@@ -92,6 +92,17 @@ final class CockpitView: NSView {
     ]
 
     private var tintedSymbolCache: [String: NSImage] = [:]
+    private static var fontCache: [String: NSFont] = [:]
+
+    private static func cachedFont(size: CGFloat, weight: NSFont.Weight, mono: Bool) -> NSFont {
+        let key = "\(size)|\(weight.rawValue)|\(mono ? 1 : 0)"
+        if let hit = fontCache[key] { return hit }
+        let font = mono
+            ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
+            : NSFont.systemFont(ofSize: size, weight: weight)
+        fontCache[key] = font
+        return font
+    }
 
     // Callbacks
     var onToggleKeepAwake: (() -> Void)?
@@ -115,7 +126,10 @@ final class CockpitView: NSView {
     // MARK: - Public Updates
     func update(metrics: SystemMetrics) {
         self.metrics = metrics
-        needsDisplay = true
+        // Skip redrawing the cockpit when a full-width overlay (Media / Slider / Amber Flash) covers it
+        if case .none = activeHUD {
+            needsDisplay = true
+        }
     }
 
     func updateWaveform(bands: [Float], isActive: Bool) {
@@ -181,6 +195,11 @@ final class CockpitView: NSView {
         if case .brightnessSlide = gestureMode { needsDisplay = true; return }
         if case .mediaScrubbing = gestureMode { needsDisplay = true; return }
 
+        let wasMediaPinned = (isMediaOverlayPinned && {
+            if case .media = activeHUD { return true }
+            return false
+        }())
+
         hudDismissTimer?.invalidate()
         mediaTickTimer?.invalidate()
         flashAnimTimer?.invalidate()
@@ -198,7 +217,16 @@ final class CockpitView: NSView {
             }
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
             if elapsed >= 3.2 {
-                self.dismissActiveHUD()
+                self.flashAnimTimer?.invalidate()
+                self.flashAnimTimer = nil
+                if wasMediaPinned {
+                    self.activeHUD = .media
+                    self.isMediaOverlayPinned = true
+                    self.configureMediaTickTimer()
+                    self.needsDisplay = true
+                } else {
+                    self.dismissActiveHUD()
+                }
             } else {
                 self.needsDisplay = true
             }
@@ -1805,26 +1833,20 @@ final class CockpitView: NSView {
     }
 
     private func drawText(_ text: String, at pt: NSPoint, size: CGFloat, weight: NSFont.Weight, color: NSColor, mono: Bool = false) {
-        let font = mono
-            ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
-            : NSFont.systemFont(ofSize: size, weight: weight)
+        let font = Self.cachedFont(size: size, weight: weight, mono: mono)
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
         (text as NSString).draw(at: pt, withAttributes: attrs)
     }
 
     private func drawTextRight(_ text: String, rightX: CGFloat, y: CGFloat, size: CGFloat, weight: NSFont.Weight, color: NSColor, mono: Bool = false) {
-        let font = mono
-            ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
-            : NSFont.systemFont(ofSize: size, weight: weight)
+        let font = Self.cachedFont(size: size, weight: weight, mono: mono)
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
         let sz = (text as NSString).size(withAttributes: attrs)
         (text as NSString).draw(at: NSPoint(x: rightX - sz.width, y: y), withAttributes: attrs)
     }
 
     private func drawTextCentered(_ text: String, centerX: CGFloat, y: CGFloat, size: CGFloat, weight: NSFont.Weight, color: NSColor, mono: Bool = false) {
-        let font = mono
-            ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
-            : NSFont.systemFont(ofSize: size, weight: weight)
+        let font = Self.cachedFont(size: size, weight: weight, mono: mono)
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
         let sz = (text as NSString).size(withAttributes: attrs)
         (text as NSString).draw(at: NSPoint(x: centerX - sz.width / 2.0, y: y), withAttributes: attrs)

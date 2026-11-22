@@ -11,12 +11,11 @@ final class ThermalSampler {
     }
 
     func sample() -> Sample {
-        let avg = TBReadSoCTemperature()
-        let peak = TBReadSoCPeakTemperature()
+        let thermal = TBReadThermalInfo()
         let fan = TBReadFanInfo()
         return Sample(
-            socTempC: avg,
-            socPeakTempC: peak,
+            socTempC: thermal.avgTempC,
+            socPeakTempC: thermal.peakTempC,
             fanAvailable: fan.available.boolValue,
             fanRPM: fan.currentRPM,
             fanMaxRPM: fan.maxRPM > 0 ? fan.maxRPM : 7200.0

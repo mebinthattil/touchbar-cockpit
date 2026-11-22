@@ -78,15 +78,12 @@ static void *DSHandle(void) {
 }
 
 static CGDirectDisplayID TBFindBuiltinDisplay(void) {
+    CGDirectDisplayID displays[16];
     uint32_t count = 0;
-    CGGetOnlineDisplayList(0, NULL, &count);
-    if (count > 0 && count <= 16) {
-        CGDirectDisplayID displays[16];
-        if (CGGetOnlineDisplayList(count, displays, &count) == kCGErrorSuccess) {
-            for (uint32_t i = 0; i < count; i++) {
-                if (CGDisplayIsBuiltin(displays[i])) {
-                    return displays[i];
-                }
+    if (CGGetOnlineDisplayList(16, displays, &count) == kCGErrorSuccess && count > 0) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (CGDisplayIsBuiltin(displays[i])) {
+                return displays[i];
             }
         }
     }
@@ -348,26 +345,53 @@ extern double IOHIDEventGetFloatValue(TBIOHIDEventRef event, int32_t field);
 #define kIOHIDEventTypeTemperature 15
 #define kIOHIDEventFieldTemperatureLevel (kIOHIDEventTypeTemperature << 16)
 
-static void TBReadSoCTempsInternal(double *outAvg, double *outPeak) {
-    *outAvg = -1.0;
-    *outPeak = -1.0;
+void TBAtomicStoreInt32(int32_t *ptr, int32_t value) {
+    __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
 
+int32_t TBAtomicLoadInt32(const int32_t *ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+static CFArrayRef TBSoCThermalServices(void) {
     static IOHIDEventSystemClientRef client = NULL;
+    static CFMutableArrayRef matchedServices = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-        if (client) {
-            NSDictionary *matching = @{
-                @"PrimaryUsagePage": @(0xff00),
-                @"PrimaryUsage": @(5)
-            };
-            IOHIDEventSystemClientSetMatching(client, (__bridge CFDictionaryRef)matching);
-        }
-    });
-    if (!client) return;
+        if (!client) return;
+        NSDictionary *matching = @{
+            @"PrimaryUsagePage": @(0xff00),
+            @"PrimaryUsage": @(5)
+        };
+        IOHIDEventSystemClientSetMatching(client, (__bridge CFDictionaryRef)matching);
+        CFArrayRef all = IOHIDEventSystemClientCopyServices(client);
+        if (!all) return;
 
-    CFArrayRef services = IOHIDEventSystemClientCopyServices(client);
-    if (!services) return;
+        matchedServices = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+        CFIndex n = CFArrayGetCount(all);
+        for (CFIndex i = 0; i < n; i++) {
+            IOHIDServiceClientRef svc = (IOHIDServiceClientRef)CFArrayGetValueAtIndex(all, i);
+            CFStringRef name = (CFStringRef)IOHIDServiceClientCopyProperty(svc, CFSTR("Product"));
+            if (!name) continue;
+            NSString *nsName = (__bridge_transfer NSString *)name;
+            BOOL isSoC = ([nsName hasPrefix:@"PMU tdie"] ||
+                          [nsName hasPrefix:@"pACC MTR Temp"] ||
+                          [nsName hasPrefix:@"eACC MTR Temp"] ||
+                          [nsName hasPrefix:@"SOC MTR Temp"]);
+            if (isSoC) {
+                CFArrayAppendValue(matchedServices, svc);
+            }
+        }
+        CFRelease(all);
+    });
+    return matchedServices;
+}
+
+TBThermalInfo TBReadThermalInfo(void) {
+    TBThermalInfo info = { -1.0, -1.0 };
+    CFArrayRef services = TBSoCThermalServices();
+    if (!services) return info;
 
     double sum = 0.0;
     int count = 0;
@@ -376,17 +400,6 @@ static void TBReadSoCTempsInternal(double *outAvg, double *outPeak) {
     CFIndex n = CFArrayGetCount(services);
     for (CFIndex i = 0; i < n; i++) {
         IOHIDServiceClientRef svc = (IOHIDServiceClientRef)CFArrayGetValueAtIndex(services, i);
-        CFStringRef name = (CFStringRef)IOHIDServiceClientCopyProperty(svc, CFSTR("Product"));
-        if (!name) continue;
-        NSString *nsName = (__bridge_transfer NSString *)name;
-
-        // Apple Silicon M2 SoC die sensors: "PMU tdie*", "eACC MTR Temp*", "pACC MTR Temp*", "SOC MTR Temp*"
-        BOOL isSoC = ([nsName hasPrefix:@"PMU tdie"] ||
-                      [nsName hasPrefix:@"pACC MTR Temp"] ||
-                      [nsName hasPrefix:@"eACC MTR Temp"] ||
-                      [nsName hasPrefix:@"SOC MTR Temp"]);
-        if (!isSoC) continue;
-
         TBIOHIDEventRef ev = IOHIDServiceClientCopyEvent(svc, kIOHIDEventTypeTemperature, 0, 0);
         if (ev) {
             double temp = IOHIDEventGetFloatValue(ev, kIOHIDEventFieldTemperatureLevel);
@@ -398,24 +411,12 @@ static void TBReadSoCTempsInternal(double *outAvg, double *outPeak) {
             }
         }
     }
-    CFRelease(services);
 
     if (count > 0) {
-        *outAvg = sum / (double)count;
-        *outPeak = peak;
+        info.avgTempC = sum / (double)count;
+        info.peakTempC = peak;
     }
-}
-
-double TBReadSoCTemperature(void) {
-    double avg = -1.0, peak = -1.0;
-    TBReadSoCTempsInternal(&avg, &peak);
-    return avg;
-}
-
-double TBReadSoCPeakTemperature(void) {
-    double avg = -1.0, peak = -1.0;
-    TBReadSoCTempsInternal(&avg, &peak);
-    return peak;
+    return info;
 }
 
 // ============================================================================
@@ -482,29 +483,57 @@ static io_connect_t TBSMCConnection(void) {
     return conn;
 }
 
+typedef struct {
+    uint32_t key;
+    uint32_t dataSize;
+    uint32_t dataType;
+} TBSMCKeyCacheEntry;
+
 static BOOL TBSMCReadKey(io_connect_t conn, const char *keyStr, SMCKeyData_t *outData) {
+    static TBSMCKeyCacheEntry cache[24];
+    static int cacheCount = 0;
+
+    uint32_t key = FourCC(keyStr);
+    uint32_t cachedSize = 0;
+    uint32_t cachedType = 0;
+    BOOL found = NO;
+
+    for (int i = 0; i < cacheCount; i++) {
+        if (cache[i].key == key) {
+            cachedSize = cache[i].dataSize;
+            cachedType = cache[i].dataType;
+            found = YES;
+            break;
+        }
+    }
+
     SMCKeyData_t input;
     memset(&input, 0, sizeof(input));
     memset(outData, 0, sizeof(*outData));
+    input.key = key;
 
-    input.key = FourCC(keyStr);
-    input.data8 = SMC_CMD_READ_KEYINFO;
-
-    size_t outSize = sizeof(SMCKeyData_t);
-    kern_return_t kr = IOConnectCallStructMethod(conn, KERNEL_INDEX_SMC, &input, sizeof(input), outData, &outSize);
-    if (kr != KERN_SUCCESS || outData->keyInfo.dataSize == 0) {
-        return NO;
+    if (!found) {
+        input.data8 = SMC_CMD_READ_KEYINFO;
+        size_t outSize = sizeof(SMCKeyData_t);
+        kern_return_t kr = IOConnectCallStructMethod(conn, KERNEL_INDEX_SMC, &input, sizeof(input), outData, &outSize);
+        if (kr != KERN_SUCCESS || outData->keyInfo.dataSize == 0) {
+            return NO;
+        }
+        cachedSize = outData->keyInfo.dataSize;
+        cachedType = outData->keyInfo.dataType;
+        if (cacheCount < 24) {
+            cache[cacheCount++] = (TBSMCKeyCacheEntry){ key, cachedSize, cachedType };
+        }
     }
 
-    input.keyInfo.dataSize = outData->keyInfo.dataSize;
+    input.keyInfo.dataSize = cachedSize;
     input.data8 = SMC_CMD_READ_BYTES;
-    uint32_t dataType = outData->keyInfo.dataType;
 
     memset(outData, 0, sizeof(*outData));
-    outSize = sizeof(SMCKeyData_t);
-    kr = IOConnectCallStructMethod(conn, KERNEL_INDEX_SMC, &input, sizeof(input), outData, &outSize);
-    outData->keyInfo.dataSize = input.keyInfo.dataSize;
-    outData->keyInfo.dataType = dataType;
+    size_t outSize = sizeof(SMCKeyData_t);
+    kern_return_t kr = IOConnectCallStructMethod(conn, KERNEL_INDEX_SMC, &input, sizeof(input), outData, &outSize);
+    outData->keyInfo.dataSize = cachedSize;
+    outData->keyInfo.dataType = cachedType;
     return kr == KERN_SUCCESS;
 }
 
@@ -534,22 +563,32 @@ TBFanInfo TBReadFanInfo(void) {
     io_connect_t conn = TBSMCConnection();
     if (conn == 0) return info;
 
+    // Cache fixed hardware fan bounds once (cuts 8 SMC syscalls down to 1!)
+    static int32_t cachedFanCount = 0;
+    static double cachedMinRPM = 0.0;
+    static double cachedMaxRPM = 7200.0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        SMCKeyData_t d;
+        if (TBSMCReadKey(conn, "FNum", &d)) cachedFanCount = (int32_t)TBSMCDecodeNumber(&d);
+        if (TBSMCReadKey(conn, "F0Mn", &d)) cachedMinRPM = TBSMCDecodeNumber(&d);
+        if (TBSMCReadKey(conn, "F0Mx", &d)) {
+            double mx = TBSMCDecodeNumber(&d);
+            if (mx > 0) cachedMaxRPM = mx;
+        }
+    });
+
+    info.fanCount = cachedFanCount;
+    info.minRPM = cachedMinRPM;
+    info.maxRPM = cachedMaxRPM;
+
     SMCKeyData_t d;
-    if (TBSMCReadKey(conn, "FNum", &d)) {
-        info.fanCount = (int32_t)TBSMCDecodeNumber(&d);
-    }
     if (TBSMCReadKey(conn, "F0Ac", &d)) {
         double rpm = TBSMCDecodeNumber(&d);
         if (rpm >= 0.0) {
             info.available = YES;
             info.currentRPM = rpm;
         }
-    }
-    if (TBSMCReadKey(conn, "F0Mn", &d)) {
-        info.minRPM = TBSMCDecodeNumber(&d);
-    }
-    if (TBSMCReadKey(conn, "F0Mx", &d)) {
-        info.maxRPM = TBSMCDecodeNumber(&d);
     }
     return info;
 }
