@@ -527,8 +527,8 @@ final class CockpitView: NSView {
             }
 
         case .volumeSlide, .brightnessSlide:
-            // Linger for 1.5s so you can put 1 finger right back down for fine adjustments!
-            scheduleHUDDismiss(after: 1.5)
+            // Linger for 3.0s after last adjustment so you can put 1 finger right back down for fine tuning
+            scheduleHUDDismiss(after: 3.0)
 
         case .idle:
             break
@@ -542,8 +542,8 @@ final class CockpitView: NSView {
         cancelLongPress()
         mediaPressedButton = nil
         isScrubbingMedia = false
-        if case .volumeSlide = gestureMode { scheduleHUDDismiss(after: 1.0) }
-        if case .brightnessSlide = gestureMode { scheduleHUDDismiss(after: 1.0) }
+        if case .volumeSlide = gestureMode { scheduleHUDDismiss(after: 3.0) }
+        if case .brightnessSlide = gestureMode { scheduleHUDDismiss(after: 3.0) }
         gestureMode = .idle
         peakTouchCount = 0
     }
