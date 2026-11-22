@@ -1158,7 +1158,7 @@ final class CockpitView: NSView {
         let timeLabelW: CGFloat = 34
         let trackX = scrubAreaX + timeLabelW + 6
         let trackW = max(40, scrubAreaW - (timeLabelW + 6) * 2)
-        let trackR = CGRect(x: trackX, y: h / 2.0 - 3.0, width: trackW, height: 6.0)
+        let trackR = CGRect(x: trackX, y: h / 2.0 - 4.0, width: trackW, height: 8.0)
 
         // Universal scrub controls: [-10s]  [◄ ───●─── ►]  [+10s]
         let skipW: CGFloat = 50
@@ -1229,16 +1229,19 @@ final class CockpitView: NSView {
             drawTextRight(formatMediaTime(curElapsed), rightX: r.scrubberTrack.minX - 6, y: 9.5, size: 9.5, weight: .semibold, color: isScrubbingMedia ? accent : NSColor(calibratedWhite: 0.78, alpha: 1.0), mono: true)
             drawText(formatMediaTime(mediaState.duration), at: NSPoint(x: r.scrubberTrack.maxX + 6, y: 9.5), size: 9.5, weight: .medium, color: NSColor(calibratedWhite: 0.50, alpha: 1.0), mono: true)
 
-            // Track + Filled Progress
+            // Track + Filled Progress (Apple Touch Bar style progress scrubber)
             drawRoundedBar(ctx: ctx, rect: r.scrubberTrack, fraction: frac, fillColor: accent)
 
-            // Thumb Knob
+            // Apple-style vertical pill playhead indicator at current progress
             let thumbX = r.scrubberTrack.minX + r.scrubberTrack.width * frac
-            let thumbR: CGFloat = isScrubbingMedia ? 7.0 : 5.0
-            let thumbRect = CGRect(x: thumbX - thumbR, y: r.scrubberTrack.midY - thumbR, width: thumbR * 2, height: thumbR * 2)
+            let thumbW: CGFloat = isScrubbingMedia ? 5.5 : 4.0
+            let thumbH: CGFloat = isScrubbingMedia ? 22.0 : 18.0
+            let thumbRect = CGRect(x: thumbX - thumbW / 2.0, y: r.scrubberTrack.midY - thumbH / 2.0, width: thumbW, height: thumbH)
+            let thumbPath = CGPath(roundedRect: thumbRect, cornerWidth: thumbW / 2.0, cornerHeight: thumbW / 2.0, transform: nil)
             ctx.saveGState()
             ctx.setFillColor(NSColor.white.cgColor)
-            ctx.fillEllipse(in: thumbRect)
+            ctx.addPath(thumbPath)
+            ctx.fillPath()
             ctx.restoreGState()
         } else {
             // Universal Interactive Scrub Controls: [-10s] [◄ ───●─── ►] [+10s]

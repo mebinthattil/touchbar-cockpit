@@ -338,13 +338,13 @@ final class MediaController {
         let script = """
         tell application "Spotify"
             try
-                set st to (player state as string)
-                if st is "stopped" then return "NONE"
+                set pState to (player state as string)
+                if pState is "stopped" then return "NONE"
                 set tName to name of current track
                 set tArtist to artist of current track
                 set tDur to (duration of current track) / 1000.0
                 set tPos to player position
-                return st & "|||" & tName & "|||" & tArtist & "|||" & (tDur as string) & "|||" & (tPos as string)
+                return pState & "|||" & tName & "|||" & tArtist & "|||" & (tDur as string) & "|||" & (tPos as string)
             on error
                 return "NONE"
             end try
@@ -371,13 +371,13 @@ final class MediaController {
         let script = """
         tell application "Music"
             try
-                set st to (player state as string)
-                if st is "stopped" then return "NONE"
+                set pState to (player state as string)
+                if pState is "stopped" then return "NONE"
                 set tName to name of current track
                 set tArtist to artist of current track
                 set tDur to duration of current track
                 set tPos to player position
-                return st & "|||" & tName & "|||" & tArtist & "|||" & (tDur as string) & "|||" & (tPos as string)
+                return pState & "|||" & tName & "|||" & tArtist & "|||" & (tDur as string) & "|||" & (tPos as string)
             on error
                 return "NONE"
             end try
