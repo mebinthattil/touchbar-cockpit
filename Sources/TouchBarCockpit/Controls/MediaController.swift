@@ -177,7 +177,7 @@ final class MediaController {
                 DispatchQueue.main.async {
                     self.onStateUpdated?(state)
                 }
-                // Refresh exact elapsed position & artwork via AppleScript
+                // Refresh exact elapsed position & artwork via AppleScript (always keep latest state even if paused)
                 if let exact = self.queryMusic() {
                     self.pushedStates["com.apple.Music"] = exact
                     self.lastState = exact

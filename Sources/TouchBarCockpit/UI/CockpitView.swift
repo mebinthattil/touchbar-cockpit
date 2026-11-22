@@ -133,11 +133,22 @@ final class CockpitView: NSView {
     }
 
     func updateWaveform(bands: [Float], isActive: Bool) {
+        let stateChanged = (self.isAudioPlaying != isActive)
         self.waveformBands = bands
         self.isAudioPlaying = isActive
         // Fast-path: only dirty the tiny 85x30pt waveform slot when cockpit is visible!
         if case .none = activeHUD {
             setNeedsDisplay(panelRects(for: bounds).clock)
+        } else if case .media = activeHUD, stateChanged {
+            // Immediately reflect on-screen play/pause in the Media Overlay!
+            if mediaState.source == .universal {
+                mediaState.isPlaying = isActive
+                needsDisplay = true
+            } else {
+                MediaController.shared.fetchNowPlaying { [weak self] state in
+                    self?.applyExternalMediaState(state)
+                }
+            }
         }
     }
 
@@ -247,8 +258,13 @@ final class CockpitView: NSView {
     }
 
     func applyExternalMediaState(_ state: NowPlayingState) {
-        let trackChanged = (state.title != mediaState.title || state.artist != mediaState.artist || state.appBundleID != mediaState.appBundleID)
-        mediaState = state
+        var next = state
+        // For browser/universal players (Zen YouTube, Chrome, IINA), sync live Play/Pause icon from real audio signal
+        if next.source == .universal {
+            next.isPlaying = isAudioPlaying
+        }
+        let trackChanged = (next.title != mediaState.title || next.artist != mediaState.artist || next.appBundleID != mediaState.appBundleID)
+        mediaState = next
         if trackChanged {
             mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
         }
@@ -293,7 +309,7 @@ final class CockpitView: NSView {
         mediaTickTimer?.invalidate()
         let needsMarquee = mediaNeedsMarquee()
         let interval: TimeInterval = needsMarquee ? (1.0 / 30.0) : 0.5
-        let metadataRefreshEvery = needsMarquee ? 90 : 6 // Refresh track/art every ~3s while pinned
+        let metadataRefreshEvery = needsMarquee ? 30 : 2 // Sync Play/Pause, position & track every 1s while overlay is open
         let tick = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             guard let self = self, case .media = self.activeHUD else { return }
             if self.isScrubbingMedia { return }
