@@ -1,4 +1,6 @@
 import AppKit
+import ApplicationServices
+import Carbon
 import CPrivateAPIs
 
 struct NowPlayingState {
@@ -33,37 +35,62 @@ final class MediaController {
 
     private let queue = DispatchQueue(label: "com.mebin.touchbarcockpit.media", qos: .userInitiated)
     private(set) var lastState = NowPlayingState()
+    private var promptedBundles: Set<String> = []
 
-    // MARK: - Fetch Live Metadata (Only binds to Spotify/Music/VLC when actually active!)
+    // MARK: - Fetch Live Metadata (Apple Music / Spotify / VLC via NSAppleScript + Zen/Chrome/IINA via AXUIElement)
     func fetchNowPlaying(completion: @escaping (NowPlayingState) -> Void) {
-        let running = Set(NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier })
-        let frontName = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Media"
+        let runningApps = NSWorkspace.shared.runningApplications
+        let runningIDs = Set(runningApps.compactMap { $0.bundleIdentifier })
+        let frontApp = NSWorkspace.shared.frontmostApplication
+
         queue.async { [weak self] in
+            guard let self = self else { return }
             var detected: NowPlayingState? = nil
 
-            // Prefer an actively playing native player first
-            if running.contains("com.spotify.client"), let s = self?.querySpotify(), s.isPlaying {
+            // 1. Check actively playing native players first (in-process NSAppleScript -> real track + duration + scrubber!)
+            if runningIDs.contains("com.spotify.client"),
+               self.ensureAutomationPermission(bundleID: "com.spotify.client"),
+               let s = self.querySpotify(), s.isPlaying {
                 detected = s
-            } else if running.contains("com.apple.Music"), let m = self?.queryMusic(), m.isPlaying {
+            } else if runningIDs.contains("com.apple.Music"),
+                      self.ensureAutomationPermission(bundleID: "com.apple.Music"),
+                      let m = self.queryMusic(), m.isPlaying {
                 detected = m
-            } else if running.contains("org.videolan.vlc"), let v = self?.queryVLC(), v.isPlaying {
+            } else if runningIDs.contains("org.videolan.vlc"),
+                      self.ensureAutomationPermission(bundleID: "org.videolan.vlc"),
+                      let v = self.queryVLC(), v.isPlaying {
                 detected = v
-            } else if running.contains("com.spotify.client"), let s = self?.querySpotify(), s.duration > 0 {
-                // Only use paused Spotify/Music if the user isn't currently in a browser (like Zen/Chrome)
-                let isBrowserFront = Self.isBrowserOrVideoAppFrontmost()
-                if !isBrowserFront { detected = s }
-            } else if running.contains("com.apple.Music"), let m = self?.queryMusic(), m.duration > 0 {
-                let isBrowserFront = Self.isBrowserOrVideoAppFrontmost()
-                if !isBrowserFront { detected = m }
+            }
+
+            // 2. If none actively playing, check if a browser/video player has a media tab (YouTube, YouTube Music, IINA)
+            if detected == nil, let browserMedia = self.detectBrowserOrPlayerWindowMedia(runningApps: runningApps, frontmost: frontApp) {
+                detected = browserMedia
+            }
+
+            // 3. Otherwise check paused Spotify / Music / VLC with a loaded track
+            if detected == nil {
+                if runningIDs.contains("com.spotify.client"),
+                   self.ensureAutomationPermission(bundleID: "com.spotify.client"),
+                   let s = self.querySpotify(), s.duration > 0 {
+                    detected = s
+                } else if runningIDs.contains("com.apple.Music"),
+                          self.ensureAutomationPermission(bundleID: "com.apple.Music"),
+                          let m = self.queryMusic(), m.duration > 0 {
+                    detected = m
+                } else if runningIDs.contains("org.videolan.vlc"),
+                          self.ensureAutomationPermission(bundleID: "org.videolan.vlc"),
+                          let v = self.queryVLC(), v.duration > 0 {
+                    detected = v
+                }
             }
 
             let finalState: NowPlayingState
             if let d = detected {
                 finalState = d
             } else {
-                var fallback = self?.lastState ?? NowPlayingState()
+                var fallback = self.lastState
                 fallback.source = .universal
-                fallback.title = Self.isBrowserOrVideoAppFrontmost() ? frontName : "Now Playing"
+                fallback.title = frontApp?.localizedName ?? "Now Playing"
                 fallback.artist = "Universal Media"
                 fallback.duration = 0
                 fallback.elapsed = 0
@@ -71,7 +98,7 @@ final class MediaController {
                 finalState = fallback
             }
 
-            self?.lastState = finalState
+            self.lastState = finalState
             DispatchQueue.main.async {
                 completion(finalState)
             }
@@ -80,9 +107,7 @@ final class MediaController {
 
     // MARK: - Universal Transport Controls (Works for Zen YouTube, Music, Spotify, Chrome, IINA!)
     func togglePlayPause(completion: ((NowPlayingState) -> Void)? = nil) {
-        // Universal HID NX_KEYTYPE_PLAY (16) always targets whichever app macOS Now Playing is playing
-        // (including Zen Browser YouTube, Chrome, IINA, Apple Music, and Spotify).
-        TBPostAuxKey(16, false)
+        TBPostAuxKey(16, false) // NX_KEYTYPE_PLAY
         lastState.isPlaying.toggle()
         lastState.fetchedAt = Date()
 
@@ -96,7 +121,7 @@ final class MediaController {
     func nextTrack(completion: ((NowPlayingState) -> Void)? = nil) {
         TBPostAuxKey(19, false) // NX_KEYTYPE_FAST
         if let completion = completion {
-            queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 self?.fetchNowPlaying(completion: completion)
             }
         }
@@ -105,7 +130,7 @@ final class MediaController {
     func previousTrack(completion: ((NowPlayingState) -> Void)? = nil) {
         TBPostAuxKey(20, false) // NX_KEYTYPE_REWIND
         if let completion = completion {
-            queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 self?.fetchNowPlaying(completion: completion)
             }
         }
@@ -118,11 +143,11 @@ final class MediaController {
         queue.async { [weak self] in
             switch src {
             case .spotify:
-                _ = self?.runAppleScript(String(format: "tell application \"Spotify\" to set player position to %.2f", clamped))
+                _ = self?.runInProcessAppleScript(String(format: "tell application \"Spotify\" to set player position to %.2f", clamped))
             case .music:
-                _ = self?.runAppleScript(String(format: "tell application \"Music\" to set player position to %.2f", clamped))
+                _ = self?.runInProcessAppleScript(String(format: "tell application \"Music\" to set player position to %.2f", clamped))
             case .vlc:
-                _ = self?.runAppleScript(String(format: "tell application \"VLC\" to set current time to %d", Int(clamped)))
+                _ = self?.runInProcessAppleScript(String(format: "tell application \"VLC\" to set current time to %d", Int(clamped)))
             case .universal:
                 break
             }
@@ -132,7 +157,6 @@ final class MediaController {
         }
     }
 
-    /// Relative scrub (+/- seconds): works for Spotify/Music/VLC, Zen YouTube, Chrome, Safari, IINA!
     func seekRelative(deltaSeconds: Double, completion: ((NowPlayingState) -> Void)? = nil) {
         let src = lastState.source
         let frontIsVideoApp = Self.isBrowserOrVideoAppFrontmost()
@@ -141,28 +165,24 @@ final class MediaController {
             case .spotify:
                 let cur = self?.lastState.interpolatedElapsed() ?? 0
                 let target = max(0, cur + deltaSeconds)
-                _ = self?.runAppleScript(String(format: "tell application \"Spotify\" to set player position to %.2f", target))
+                _ = self?.runInProcessAppleScript(String(format: "tell application \"Spotify\" to set player position to %.2f", target))
             case .music:
                 let cur = self?.lastState.interpolatedElapsed() ?? 0
                 let target = max(0, cur + deltaSeconds)
-                _ = self?.runAppleScript(String(format: "tell application \"Music\" to set player position to %.2f", target))
+                _ = self?.runInProcessAppleScript(String(format: "tell application \"Music\" to set player position to %.2f", target))
             case .vlc:
                 let cur = self?.lastState.interpolatedElapsed() ?? 0
                 let target = max(0, cur + deltaSeconds)
-                _ = self?.runAppleScript(String(format: "tell application \"VLC\" to set current time to %d", Int(target)))
+                _ = self?.runInProcessAppleScript(String(format: "tell application \"VLC\" to set current time to %d", Int(target)))
             case .universal:
-                // 1) Try MediaRemote skip command (supported by MediaSession players)
                 let ok = TBMediaRemoteSkip(deltaSeconds)
-                // 2) For Zen Browser YouTube / Chrome / Safari / IINA when frontmost, also support native arrow/J/L seek
                 if frontIsVideoApp {
-                    // Left arrow = 123 (-5s on YouTube/IINA), Right arrow = 124 (+5s on YouTube/IINA)
                     let steps = max(1, Int(round(abs(deltaSeconds) / 5.0)))
                     let keyCode: UInt16 = deltaSeconds >= 0 ? 124 : 123
                     for _ in 0..<min(4, steps) {
                         TBPostKeyCode(keyCode)
                     }
                 } else if !ok {
-                    // Fallback: brief HID rewind/fast-forward
                     TBPostAuxKey(deltaSeconds >= 0 ? 19 : 20, false)
                 }
             }
@@ -170,6 +190,133 @@ final class MediaController {
                 self?.fetchNowPlaying(completion: completion)
             }
         }
+    }
+
+    // MARK: - Automation Permission Check (Prompts cleanly once per target app)
+    private func ensureAutomationPermission(bundleID: String) -> Bool {
+        var targetDesc = AEAddressDesc()
+        guard let cStr = bundleID.cString(using: .utf8) else { return false }
+        let createErr = AECreateDesc(DescType(typeApplicationBundleID), cStr, strlen(cStr), &targetDesc)
+        guard createErr == noErr else { return false }
+        defer { AEDisposeDesc(&targetDesc) }
+
+        let shouldAsk = !promptedBundles.contains(bundleID)
+        promptedBundles.insert(bundleID)
+
+        let status = AEDeterminePermissionToAutomateTarget(
+            &targetDesc,
+            AEEventClass(typeWildCard),
+            AEEventID(typeWildCard),
+            shouldAsk
+        )
+        return status == noErr
+    }
+
+    // MARK: - Accessibility Window Title Detection for Zen / Chrome / Safari / IINA
+    private func detectBrowserOrPlayerWindowMedia(runningApps: [NSRunningApplication], frontmost: NSRunningApplication?) -> NowPlayingState? {
+        guard TBIsAccessibilityTrusted(false) else { return nil }
+
+        // Check IINA first if running, then browsers (prefer frontmost browser)
+        let mediaAppHints = ["iina", "zen", "chrome", "safari", "firefox", "arc", "brave"]
+        var candidates = runningApps.filter { app in
+            guard let bid = app.bundleIdentifier?.lowercased() else { return false }
+            return mediaAppHints.contains(where: { bid.contains($0) })
+        }
+        // Put frontmost candidate first
+        if let frontPID = frontmost?.processIdentifier {
+            candidates.sort { ($0.processIdentifier == frontPID ? 0 : 1) < ($1.processIdentifier == frontPID ? 0 : 1) }
+        }
+
+        for app in candidates {
+            let appName = app.localizedName ?? "Browser"
+            let bid = app.bundleIdentifier?.lowercased() ?? ""
+            let titles = windowTitles(forPID: app.processIdentifier)
+
+            for rawTitle in titles {
+                if bid.contains("iina"), !rawTitle.isEmpty, rawTitle != "IINA" {
+                    return NowPlayingState(
+                        source: .universal,
+                        title: rawTitle,
+                        artist: "IINA",
+                        duration: 0,
+                        elapsed: 0,
+                        isPlaying: lastState.isPlaying,
+                        canSeek: false,
+                        fetchedAt: Date()
+                    )
+                }
+
+                // Match YouTube / YouTube Music / Spotify Web / SoundCloud / Netflix / Twitch tabs
+                if let parsed = parseMediaBrowserTitle(rawTitle, appName: appName) {
+                    return NowPlayingState(
+                        source: .universal,
+                        title: parsed.title,
+                        artist: parsed.subtitle,
+                        duration: 0,
+                        elapsed: 0,
+                        isPlaying: lastState.isPlaying,
+                        canSeek: false,
+                        fetchedAt: Date()
+                    )
+                }
+            }
+        }
+        return nil
+    }
+
+    private func windowTitles(forPID pid: pid_t) -> [String] {
+        let appElem = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement] else {
+            return []
+        }
+        var result: [String] = []
+        for win in windows {
+            var titleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+               let title = titleRef as? String, !title.isEmpty {
+                result.append(title)
+            }
+        }
+        return result
+    }
+
+    private func parseMediaBrowserTitle(_ raw: String, appName: String) -> (title: String, subtitle: String)? {
+        // Strip browser suffix (" — Zen Browser", " - Google Chrome", etc.)
+        var cleaned = raw
+        for suffix in [" — Zen Browser", " - Zen Browser", " — Mozilla Firefox", " - Google Chrome", " - Brave", " - Arc"] {
+            if cleaned.hasSuffix(suffix) {
+                cleaned = String(cleaned.dropLast(suffix.count))
+            }
+        }
+
+        // Remove leading notification count like "(2) "
+        if cleaned.hasPrefix("("), let closeParen = cleaned.firstIndex(of: ")") {
+            let inside = cleaned[cleaned.index(after: cleaned.startIndex)..<closeParen]
+            if inside.allSatisfy({ $0.isNumber }) {
+                cleaned = String(cleaned[cleaned.index(after: closeParen)...]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+
+        let services: [(marker: String, label: String)] = [
+            (" - YouTube Music", "YouTube Music · \(appName)"),
+            (" - YouTube", "YouTube · \(appName)"),
+            (" | Spotify", "Spotify Web · \(appName)"),
+            (" - SoundCloud", "SoundCloud · \(appName)"),
+            (" - Twitch", "Twitch · \(appName)"),
+            (" - Netflix", "Netflix · \(appName)")
+        ]
+
+        for svc in services {
+            if let range = cleaned.range(of: svc.marker, options: .backwards) {
+                let title = String(cleaned[..<range.lowerBound]).trimmingCharacters(in: .whitespaces)
+                if !title.isEmpty {
+                    return (title, svc.label)
+                }
+            }
+        }
+        return nil
     }
 
     private static func isBrowserOrVideoAppFrontmost() -> Bool {
@@ -186,7 +333,7 @@ final class MediaController {
                bid.contains("vlc")
     }
 
-    // MARK: - Player-Specific Queries (Wrapped in try/on error so idle apps never error)
+    // MARK: - Native Player Queries (In-Process NSAppleScript -> ~3ms!)
     private func querySpotify() -> NowPlayingState? {
         let script = """
         tell application "Spotify"
@@ -203,7 +350,7 @@ final class MediaController {
             end try
         end tell
         """
-        guard let out = runAppleScript(script), out != "NONE" else { return nil }
+        guard let out = runInProcessAppleScript(script), out != "NONE" else { return nil }
         let parts = out.components(separatedBy: "|||")
         guard parts.count >= 5 else { return nil }
         let dur = Double(parts[3].replacingOccurrences(of: ",", with: ".")) ?? 0
@@ -236,7 +383,7 @@ final class MediaController {
             end try
         end tell
         """
-        guard let out = runAppleScript(script), out != "NONE" else { return nil }
+        guard let out = runInProcessAppleScript(script), out != "NONE" else { return nil }
         let parts = out.components(separatedBy: "|||")
         guard parts.count >= 5 else { return nil }
         let dur = Double(parts[3].replacingOccurrences(of: ",", with: ".")) ?? 0
@@ -267,7 +414,7 @@ final class MediaController {
             end try
         end tell
         """
-        guard let out = runAppleScript(script), out != "NONE" else { return nil }
+        guard let out = runInProcessAppleScript(script), out != "NONE" else { return nil }
         let parts = out.components(separatedBy: "|||")
         guard parts.count >= 4 else { return nil }
         let dur = Double(parts[2].replacingOccurrences(of: ",", with: ".")) ?? 0
@@ -284,22 +431,11 @@ final class MediaController {
         )
     }
 
-    private func runAppleScript(_ source: String) -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", source]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do {
-            try proc.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            guard proc.terminationStatus == 0,
-                  let text = String(data: data, encoding: .utf8) else { return nil }
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
-        } catch {
-            return nil
-        }
+    private func runInProcessAppleScript(_ source: String) -> String? {
+        guard let script = NSAppleScript(source: source) else { return nil }
+        var err: NSDictionary?
+        let result = script.executeAndReturnError(&err)
+        guard err == nil else { return nil }
+        return result.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
