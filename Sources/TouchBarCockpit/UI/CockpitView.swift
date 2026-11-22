@@ -11,10 +11,12 @@ final class CockpitView: NSView {
         case brightness(value: Float)
         case infoToast(title: String, detail: String, accent: NSColor)
         case media
+        case agentFlash(agent: String, startTime: CFAbsoluteTime)
     }
 
     private var activeHUD: ActiveHUD = .none
     private var hudDismissTimer: Timer?
+    private var flashAnimTimer: Timer?
 
     // MARK: - Media Overlay State
     private var mediaState = NowPlayingState()
@@ -144,10 +146,46 @@ final class CockpitView: NSView {
         hudDismissTimer = nil
         mediaTickTimer?.invalidate()
         mediaTickTimer = nil
+        flashAnimTimer?.invalidate()
+        flashAnimTimer = nil
         mediaPressedButton = nil
         isScrubbingMedia = false
         activeHUD = .none
         needsDisplay = true
+    }
+
+    /// Gently breathes the entire Touch Bar warm amber for 3.0s when a coding agent finishes its turn.
+    func triggerAgentFlash(agent: String) {
+        // Don't interrupt an active drag/gesture
+        if case .volumeSlide = gestureMode { return }
+        if case .brightnessSlide = gestureMode { return }
+        if case .mediaScrubbing = gestureMode { return }
+
+        hudDismissTimer?.invalidate()
+        mediaTickTimer?.invalidate()
+        flashAnimTimer?.invalidate()
+
+        let start = CFAbsoluteTimeGetCurrent()
+        activeHUD = .agentFlash(agent: agent, startTime: start)
+        needsDisplay = true
+
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard case .agentFlash(_, let t0) = self.activeHUD else {
+                self.flashAnimTimer?.invalidate()
+                self.flashAnimTimer = nil
+                return
+            }
+            let elapsed = CFAbsoluteTimeGetCurrent() - t0
+            if elapsed >= 3.0 {
+                self.dismissActiveHUD()
+            } else {
+                self.needsDisplay = true
+            }
+        }
+        timer.tolerance = 0.008
+        RunLoop.main.add(timer, forMode: .common)
+        flashAnimTimer = timer
     }
 
     private func openMediaOverlay(togglePlayback: Bool) {
@@ -695,11 +733,13 @@ final class CockpitView: NSView {
 
     // MARK: - Single Tap Panel Interactions
     private func handleSingleTap(at point: NSPoint) {
-        // Dismiss any active toast if tapped
+        // Dismiss any active toast or agent flash if tapped
         if case .infoToast = activeHUD {
-            hudDismissTimer?.invalidate()
-            activeHUD = .none
-            needsDisplay = true
+            dismissActiveHUD()
+            return
+        }
+        if case .agentFlash = activeHUD {
+            dismissActiveHUD()
             return
         }
 
@@ -831,6 +871,10 @@ final class CockpitView: NSView {
 
         case .media:
             drawMediaOverlay(ctx: ctx)
+            return
+
+        case .agentFlash(let agent, let startTime):
+            drawAgentAmberFlash(ctx: ctx, agent: agent, elapsed: CFAbsoluteTimeGetCurrent() - startTime)
             return
 
         case .none:
@@ -1231,6 +1275,49 @@ final class CockpitView: NSView {
 
         drawTextCentered(title, centerX: badgeRect.midX, y: 9.5, size: 9.5, weight: .bold, color: accent)
         drawText(detail, at: NSPoint(x: badgeRect.maxX + 14, y: 8.5), size: 11.5, weight: .medium, color: .white, mono: true)
+    }
+
+    // MARK: - Full-Width Gentle Breathing Amber Flash (Coding Agent Turn Complete)
+    private func drawAgentAmberFlash(ctx: CGContext, agent: String, elapsed: TimeInterval) {
+        let duration: Double = 3.0
+        let t = min(duration, max(0, elapsed))
+        // Two smooth gentle breaths over 3.0s: sin^2(pi * t / 1.5), wrapped in a soft outer fade
+        let breath = sin(.pi * t / 1.5)
+        let intensity = CGFloat(breath * breath) // 0.0 -> 1.0 -> 0.0 -> 1.0 -> 0.0
+
+        // Warm OLED amber gradient across full 1004x30pt width
+        let edgeAmber = NSColor(calibratedRed: 0.90, green: 0.45, blue: 0.04, alpha: 0.14 + 0.58 * intensity).cgColor
+        let midAmber  = NSColor(calibratedRed: 0.99, green: 0.68, blue: 0.12, alpha: 0.20 + 0.72 * intensity).cgColor
+        let cs = CGColorSpaceCreateDeviceRGB()
+
+        ctx.saveGState()
+        if let grad = CGGradient(colorsSpace: cs, colors: [edgeAmber, midAmber, edgeAmber] as CFArray, locations: [0.0, 0.5, 1.0]) {
+            ctx.drawLinearGradient(
+                grad,
+                start: CGPoint(x: bounds.minX, y: bounds.midY),
+                end: CGPoint(x: bounds.maxX, y: bounds.midY),
+                options: []
+            )
+        }
+
+        // Subtle luminous top hairline
+        ctx.setFillColor(NSColor(calibratedRed: 1.0, green: 0.86, blue: 0.45, alpha: 0.25 + 0.65 * intensity).cgColor)
+        ctx.fill(CGRect(x: 0, y: bounds.height - 1.5, width: bounds.width, height: 1.5))
+        ctx.restoreGState()
+
+        // Crisp centered pill label so you immediately know which harness is waiting
+        let label = "✦  \(agent.uppercased()) WAITING FOR YOUR TURN"
+        let pillW: CGFloat = 240
+        let pillRect = CGRect(x: bounds.midX - pillW / 2.0, y: 5, width: pillW, height: 20)
+        let pillPath = CGPath(roundedRect: pillRect, cornerWidth: 10, cornerHeight: 10, transform: nil)
+        ctx.saveGState()
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.55).cgColor)
+        ctx.addPath(pillPath)
+        ctx.fillPath()
+        ctx.restoreGState()
+
+        let textColor = NSColor(calibratedRed: 1.0, green: 0.90, blue: 0.65, alpha: 0.65 + 0.35 * intensity)
+        drawTextCentered(label, centerX: bounds.midX, y: 8.5, size: 10, weight: .bold, color: textColor)
     }
 
     // MARK: - Interactive Long-Press Media Overlay

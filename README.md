@@ -16,6 +16,7 @@ A lightweight, native Swift (`DFRFoundation`) Touch Bar daemon for Apple Silicon
 * **Long-Press anywhere (~0.4s)** → Pauses media and opens the full-width Media Overlay (`Prev`, `Play/Pause`, `Next`, plus timeline scrubber for Spotify/Music/VLC or `-10s` / drag jog-scrubber / `+10s` for Zen Browser YouTube, Chrome, IINA, etc.)
 * **Tap Clock** → Opens the Media Overlay immediately without pausing playback
 * **Single-Tap `Fn`** → Pause cockpit and restore macOS's native Touch Bar; tap `Fn` again to resume
+* **Coding Agent Turn-Complete Flash** → Gently breathes the entire Touch Bar warm amber for 3s when Antigravity (`agy`), Claude Code, or Codex finishes its turn and waits for you (zero-polling `DistributedNotificationCenter`, triggered via `TouchBarCockpit --flash <agent>`)
 
 ## Build & Run
 

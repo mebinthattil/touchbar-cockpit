@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupCallbacks()
         setupSystemObservers()
         setupFnKeyMonitor()
+        setupAgentNotificationObserver()
 
         audioSpectrumTap.onUpdate = { [weak self] bands, isActive in
             self?.touchBarController.updateWaveform(bands: bands, isActive: isActive)
@@ -69,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let m = globalFlagsMonitor { NSEvent.removeMonitor(m) }
         if let m = localFlagsMonitor { NSEvent.removeMonitor(m) }
         if let m = globalKeyMonitor { NSEvent.removeMonitor(m) }
+        DistributedNotificationCenter.default().removeObserver(self)
         KeepAwakeManager.shared.disable()
         touchBarController.dismiss()
     }
@@ -206,6 +208,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             apply()
         } else {
             DispatchQueue.main.async(execute: apply)
+        }
+    }
+
+    // MARK: - Coding Agent Turn-Complete Notification (Zero-Polling DistributedNotificationCenter)
+    private func setupAgentNotificationObserver() {
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleAgentReadyNotification(_:)),
+            name: Notification.Name("com.mebin.touchbarcockpit.agentReady"),
+            object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
+    }
+
+    @objc private func handleAgentReadyNotification(_ notification: Notification) {
+        guard !isPaused, !isScreenAsleep else { return }
+        let agent = (notification.object as? String) ?? "Agent"
+        DispatchQueue.main.async { [weak self] in
+            self?.touchBarController.triggerAgentFlash(agent: agent)
         }
     }
 

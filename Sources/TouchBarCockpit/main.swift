@@ -1,5 +1,18 @@
 import AppKit
 
+// Fast-path CLI trigger: `TouchBarCockpit --flash [agentName]`
+// Posts a zero-polling DistributedNotification to the running daemon and exits in ~4ms.
+if let flashIdx = CommandLine.arguments.firstIndex(of: "--flash") {
+    let agent = (flashIdx + 1 < CommandLine.arguments.count) ? CommandLine.arguments[flashIdx + 1] : "Agent"
+    DistributedNotificationCenter.default().postNotificationName(
+        Notification.Name("com.mebin.touchbarcockpit.agentReady"),
+        object: agent,
+        userInfo: nil,
+        deliverImmediately: true
+    )
+    exit(0)
+}
+
 // Single-instance check (avoid stacking duplicate modal Touch Bars)
 let myPID = ProcessInfo.processInfo.processIdentifier
 if let bundleID = Bundle.main.bundleIdentifier {

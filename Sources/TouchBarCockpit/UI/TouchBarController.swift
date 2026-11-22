@@ -84,6 +84,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         cockpitView.updateWaveform(bands: bands, isActive: isActive)
     }
 
+    func triggerAgentFlash(agent: String) {
+        cockpitView.triggerAgentFlash(agent: agent)
+    }
+
     // MARK: - NSTouchBarDelegate
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         guard identifier == Self.itemIdentifier else { return nil }
