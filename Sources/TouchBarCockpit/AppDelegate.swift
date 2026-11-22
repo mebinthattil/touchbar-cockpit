@@ -42,6 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         audioSpectrumTap.onUpdate = { [weak self] bands, isActive in
             self?.touchBarController.updateWaveform(bands: bands, isActive: isActive)
         }
+        MediaController.shared.onStateUpdated = { [weak self] state in
+            self?.touchBarController.cockpitView.applyExternalMediaState(state)
+        }
 
         // Initial sample + present Touch Bar
         sampleMetrics(includeSlowSensors: true)
@@ -266,12 +269,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let priority = ["com.mitchellh.ghostty", "net.kovidgoyal.kitty", "com.googlecode.iterm2", "dev.warp.Warp-Stable", "com.apple.Terminal"]
         for bid in priority {
             if let app = running.first(where: { $0.bundleIdentifier == bid }) {
-                app.activate(options: [.activateIgnoringOtherApps])
+                app.activate()
                 return
             }
         }
         if let app = running.first(where: { isTerminalApp($0) }) {
-            app.activate(options: [.activateIgnoringOtherApps])
+            app.activate()
         }
     }
 
@@ -280,6 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let reattachSelector = #selector(handleSystemWake)
 
         ws.addObserver(self, selector: #selector(handleAppActivated(_:)), name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        ws.addObserver(self, selector: #selector(handleAppTerminated(_:)), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
         ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.willSleepNotification, object: nil)
         ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.screensDidSleepNotification, object: nil)
         ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
@@ -294,6 +298,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if Self.isTerminalApp(app) {
             touchBarController.clearWaitingAgent()
         }
+    }
+
+    @objc private func handleAppTerminated(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              let bid = app.bundleIdentifier else { return }
+        MediaController.shared.handleAppTerminated(bundleID: bid)
     }
 
     @objc private func handleSystemSleep() {

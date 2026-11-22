@@ -218,8 +218,23 @@ final class CockpitView: NSView {
         }
     }
 
+    func applyExternalMediaState(_ state: NowPlayingState) {
+        let trackChanged = (state.title != mediaState.title || state.artist != mediaState.artist || state.appBundleID != mediaState.appBundleID)
+        mediaState = state
+        if trackChanged {
+            mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
+        }
+        if case .media = activeHUD {
+            configureMediaTickTimer()
+            needsDisplay = true
+        }
+    }
+
     private func openMediaOverlay(togglePlayback: Bool, pinned: Bool) {
         cancelLongPress()
+        // Immediately purge stale state if the previous player app was quit!
+        MediaController.shared.invalidateIfClosed()
+        mediaState = MediaController.shared.lastState
         activeHUD = .media
         isMediaOverlayPinned = pinned
         mediaPressedButton = nil
@@ -232,23 +247,12 @@ final class CockpitView: NSView {
         resetMediaAutoDismissIfNeeded()
 
         let onState: (NowPlayingState) -> Void = { [weak self] state in
-            guard let self = self else { return }
-            let trackChanged = (state.title != self.mediaState.title || state.artist != self.mediaState.artist)
-            self.mediaState = state
-            if trackChanged {
-                self.mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
-            }
-            if case .media = self.activeHUD {
-                self.configureMediaTickTimer()
-                self.needsDisplay = true
-            }
+            self?.applyExternalMediaState(state)
         }
 
         if togglePlayback {
-            // Immediately toggle play/pause universally (works for Zen YouTube, Apple Music, Spotify, IINA)
             MediaController.shared.togglePlayPause(completion: onState)
         } else {
-            // Open media controls without pausing/toggling playback
             MediaController.shared.fetchNowPlaying(completion: onState)
         }
 
@@ -267,17 +271,10 @@ final class CockpitView: NSView {
             if self.isScrubbingMedia { return }
             self.mediaMarqueeTickCount += 1
 
-            // Keep track title, album cover, and duration live if song advances while pinned open
-            if self.isMediaOverlayPinned && self.mediaMarqueeTickCount % metadataRefreshEvery == 0 {
+            // Keep track title, album cover, player switch, and duration live while Media Overlay is open
+            if self.mediaMarqueeTickCount % metadataRefreshEvery == 0 {
                 MediaController.shared.fetchNowPlaying { [weak self] state in
-                    guard let self = self, case .media = self.activeHUD else { return }
-                    let changed = (state.title != self.mediaState.title || state.artist != self.mediaState.artist)
-                    self.mediaState = state
-                    if changed {
-                        self.mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
-                        self.configureMediaTickTimer()
-                    }
-                    self.needsDisplay = true
+                    self?.applyExternalMediaState(state)
                 }
             }
 
