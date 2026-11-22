@@ -72,13 +72,13 @@ final class CockpitView: NSView {
     // Cached Formatters & Symbol Images (eliminates repeated ICU / bitmap allocations per frame)
     private static let timeFormatter: DateFormatter = {
         let df = DateFormatter()
-        df.dateFormat = "HH:mm:ss"
+        df.dateFormat = "h:mm:ss"
         return df
     }()
 
     private static let dayFormatter: DateFormatter = {
         let df = DateFormatter()
-        df.dateFormat = "EEE d"
+        df.dateFormat = "a · EEE d"
         return df
     }()
 
