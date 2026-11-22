@@ -30,6 +30,14 @@ final class CockpitView: NSView {
     }
 
     // MARK: - Multi-Touch Gesture State
+    private struct SliderTrackState {
+        var lastAvgX: CGFloat
+        var lastTouchCount: Int
+        var accumulatedPx: CGFloat = 0
+        var lastStepOffset: Int = 0
+        var startValue: Float
+    }
+
     private enum GestureMode {
         case idle
         case pendingTap(startPoint: NSPoint, startTime: TimeInterval)
@@ -38,8 +46,8 @@ final class CockpitView: NSView {
         case mediaScrubbing
         case mediaJogScrubbing(startX: CGFloat, lastStep: Int)
         case twoFingerPending(startX: CGFloat, startTime: TimeInterval, startVolume: Float)
-        case volumeSlide(startX: CGFloat, startVolume: Float, lastStepOffset: Int)
-        case brightnessSlide(startX: CGFloat, startBrightness: Float, lastStepOffset: Int)
+        case volumeSlide(SliderTrackState)
+        case brightnessSlide(SliderTrackState)
     }
 
     private var gestureMode: GestureMode = .idle
@@ -149,6 +157,20 @@ final class CockpitView: NSView {
         if count == 1 {
             let pt = active[0].location(in: self)
 
+            // If Volume or Brightness slider HUD is already open, 1 finger immediately grabs it for fine control!
+            if case .volume = activeHUD {
+                hudDismissTimer?.invalidate()
+                let curVol = AudioController.shared.getVolume()
+                gestureMode = .volumeSlide(SliderTrackState(lastAvgX: pt.x, lastTouchCount: 1, startValue: curVol))
+                return
+            }
+            if case .brightness = activeHUD {
+                hudDismissTimer?.invalidate()
+                let curBright = BrightnessController.shared.getDisplayBrightness()
+                gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: pt.x, lastTouchCount: 1, startValue: curBright))
+                return
+            }
+
             // If Media Overlay is currently open, route 1-finger touches directly to Media controls / scrubber
             if case .media = activeHUD {
                 let mRects = mediaOverlayRects(for: bounds)
@@ -223,12 +245,33 @@ final class CockpitView: NSView {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.38, execute: work)
         } else if count == 2 {
             let avgX = averageX(active)
+            // If already in a Brightness or Volume slide, smoothly re-anchor without resetting or jumping!
+            switch gestureMode {
+            case .brightnessSlide(var st):
+                st.lastAvgX = avgX
+                st.lastTouchCount = count
+                gestureMode = .brightnessSlide(st)
+                return
+            case .volumeSlide(var st):
+                st.lastAvgX = avgX
+                st.lastTouchCount = count
+                gestureMode = .volumeSlide(st)
+                return
+            default:
+                break
+            }
             let curVol = AudioController.shared.getVolume()
             gestureMode = .twoFingerPending(startX: avgX, startTime: now, startVolume: curVol)
         } else if count >= 3 {
             let avgX = averageX(active)
+            if case .brightnessSlide(var st) = gestureMode {
+                st.lastAvgX = avgX
+                st.lastTouchCount = count
+                gestureMode = .brightnessSlide(st)
+                return
+            }
             let curBright = BrightnessController.shared.getDisplayBrightness()
-            gestureMode = .brightnessSlide(startX: avgX, startBrightness: curBright, lastStepOffset: 0)
+            gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: avgX, lastTouchCount: count, startValue: curBright))
             hudDismissTimer?.invalidate()
             mediaTickTimer?.invalidate()
             activeHUD = .brightness(value: curBright)
@@ -254,7 +297,7 @@ final class CockpitView: NSView {
         case .pendingTap(let startPt, _):
             if count >= 3 {
                 let b = BrightnessController.shared.getDisplayBrightness()
-                gestureMode = .brightnessSlide(startX: avgX, startBrightness: b, lastStepOffset: 0)
+                gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: avgX, lastTouchCount: count, startValue: b))
                 hudDismissTimer?.invalidate()
                 mediaTickTimer?.invalidate()
                 activeHUD = .brightness(value: b)
@@ -304,32 +347,55 @@ final class CockpitView: NSView {
         case .twoFingerPending(let startX, _, let startVol):
             if count >= 3 {
                 let b = BrightnessController.shared.getDisplayBrightness()
-                gestureMode = .brightnessSlide(startX: avgX, startBrightness: b, lastStepOffset: 0)
+                gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: avgX, lastTouchCount: count, startValue: b))
                 hudDismissTimer?.invalidate()
                 mediaTickTimer?.invalidate()
                 activeHUD = .brightness(value: b)
                 needsDisplay = true
             } else if abs(avgX - startX) > 4.0 {
-                let nextOffset = applyVolumeSlide(currentX: avgX, startX: startX, startVol: startVol, lastStepOffset: 0)
-                gestureMode = .volumeSlide(startX: startX, startVolume: startVol, lastStepOffset: nextOffset)
+                var st = SliderTrackState(lastAvgX: avgX, lastTouchCount: count, accumulatedPx: avgX - startX, lastStepOffset: 0, startValue: startVol)
+                applyVolumeSlide(&st)
+                gestureMode = .volumeSlide(st)
             }
 
-        case .volumeSlide(let startX, let startVol, let lastOffset):
+        case .volumeSlide(var st):
             if count >= 3 {
                 let b = BrightnessController.shared.getDisplayBrightness()
-                gestureMode = .brightnessSlide(startX: avgX, startBrightness: b, lastStepOffset: 0)
+                gestureMode = .brightnessSlide(SliderTrackState(lastAvgX: avgX, lastTouchCount: count, startValue: b))
                 hudDismissTimer?.invalidate()
                 mediaTickTimer?.invalidate()
                 activeHUD = .brightness(value: b)
                 needsDisplay = true
             } else {
-                let nextOffset = applyVolumeSlide(currentX: avgX, startX: startX, startVol: startVol, lastStepOffset: lastOffset)
-                gestureMode = .volumeSlide(startX: startX, startVolume: startVol, lastStepOffset: nextOffset)
+                if count != st.lastTouchCount {
+                    // Seamless finger-count handoff (e.g. 2 -> 1 finger): re-anchor with ZERO jump!
+                    st.lastAvgX = avgX
+                    st.lastTouchCount = count
+                } else {
+                    let rawDx = avgX - st.lastAvgX
+                    st.lastAvgX = avgX
+                    // Finer sensitivity when using 1 finger (0.65x) vs quick glide with 2 fingers (1.0x)
+                    let scale: CGFloat = (count == 1) ? 0.65 : 1.0
+                    st.accumulatedPx += rawDx * scale
+                    applyVolumeSlide(&st)
+                }
+                gestureMode = .volumeSlide(st)
             }
 
-        case .brightnessSlide(let startX, let startBright, let lastOffset):
-            let nextOffset = applyBrightnessSlide(currentX: avgX, startX: startX, startBright: startBright, lastStepOffset: lastOffset)
-            gestureMode = .brightnessSlide(startX: startX, startBrightness: startBright, lastStepOffset: nextOffset)
+        case .brightnessSlide(var st):
+            if count != st.lastTouchCount {
+                // Seamless finger-count handoff (e.g. 3 -> 2 -> 1 finger): re-anchor with ZERO jump!
+                st.lastAvgX = avgX
+                st.lastTouchCount = count
+            } else {
+                let rawDx = avgX - st.lastAvgX
+                st.lastAvgX = avgX
+                // Finer sensitivity when using 1 finger (0.65x) vs quick glide with 2-3 fingers (1.0x)
+                let scale: CGFloat = (count == 1) ? 0.65 : 1.0
+                st.accumulatedPx += rawDx * scale
+                applyBrightnessSlide(&st)
+            }
+            gestureMode = .brightnessSlide(st)
 
         case .idle:
             break
@@ -337,11 +403,37 @@ final class CockpitView: NSView {
     }
 
     override func touchesEnded(with event: NSEvent) {
-        let remaining = event.touches(matching: .touching, in: self)
+        let remaining = Array(event.touches(matching: .touching, in: self))
         let now = ProcessInfo.processInfo.systemUptime
 
-        // Only finalize when all fingers have lifted
-        guard remaining.isEmpty else { return }
+        // If some fingers lifted while others remain (e.g., 3 -> 1 or 2 -> 1),
+        // re-anchor centroid immediately so the remaining 1 finger continues with ZERO jump!
+        if !remaining.isEmpty {
+            let newAvgX = averageX(remaining)
+            switch gestureMode {
+            case .brightnessSlide(var st):
+                st.lastAvgX = newAvgX
+                st.lastTouchCount = remaining.count
+                gestureMode = .brightnessSlide(st)
+            case .volumeSlide(var st):
+                st.lastAvgX = newAvgX
+                st.lastTouchCount = remaining.count
+                gestureMode = .volumeSlide(st)
+            case .twoFingerPending(_, _, let startVol):
+                // User started with 2 fingers and dropped to 1 finger -> open Volume panel for 1-finger fine control!
+                if remaining.count == 1 {
+                    let st = SliderTrackState(lastAvgX: newAvgX, lastTouchCount: 1, startValue: startVol)
+                    gestureMode = .volumeSlide(st)
+                    hudDismissTimer?.invalidate()
+                    mediaTickTimer?.invalidate()
+                    activeHUD = .volume(value: startVol, muted: AudioController.shared.isMuted())
+                    needsDisplay = true
+                }
+            default:
+                break
+            }
+            return
+        }
 
         cancelLongPress()
 
@@ -386,12 +478,13 @@ final class CockpitView: NSView {
                 let vol = AudioController.shared.getVolume()
                 mediaTickTimer?.invalidate()
                 activeHUD = .volume(value: vol, muted: muted)
-                scheduleHUDDismiss(after: 0.75)
+                scheduleHUDDismiss(after: 1.0)
                 needsDisplay = true
             }
 
         case .volumeSlide, .brightnessSlide:
-            scheduleHUDDismiss(after: 0.45)
+            // Linger for 1.5s so you can put 1 finger right back down for fine adjustments!
+            scheduleHUDDismiss(after: 1.5)
 
         case .idle:
             break
@@ -405,8 +498,8 @@ final class CockpitView: NSView {
         cancelLongPress()
         mediaPressedButton = nil
         isScrubbingMedia = false
-        if case .volumeSlide = gestureMode { scheduleHUDDismiss(after: 0.35) }
-        if case .brightnessSlide = gestureMode { scheduleHUDDismiss(after: 0.35) }
+        if case .volumeSlide = gestureMode { scheduleHUDDismiss(after: 1.0) }
+        if case .brightnessSlide = gestureMode { scheduleHUDDismiss(after: 1.0) }
         gestureMode = .idle
         peakTouchCount = 0
     }
@@ -417,18 +510,18 @@ final class CockpitView: NSView {
         return sum / CGFloat(touches.count)
     }
 
-    private func applyVolumeSlide(currentX: CGFloat, startX: CGFloat, startVol: Float, lastStepOffset: Int) -> Int {
+    private func applyVolumeSlide(_ st: inout SliderTrackState) {
         hudDismissTimer?.invalidate()
         mediaTickTimer?.invalidate()
 
         if TBIsAccessibilityTrusted(false) {
-            // 5.5pt per 1/64th fine native HID step (~350pt full sweep) -> triggers native macOS 27 HUD!
-            let targetOffset = Int(round((currentX - startX) / 5.5))
-            let diff = targetOffset - lastStepOffset
+            // 5.5pt per 1/64th fine native HID step (~350pt full sweep at 2F; ~540pt at 1F fine control!)
+            let targetOffset = Int(round(st.accumulatedPx / 5.5))
+            let diff = targetOffset - st.lastStepOffset
             if diff != 0 {
                 _ = AudioController.shared.nudgeVolumeFine(steps: diff)
-                // Read back shortly after HID event applies so Touch Bar HUD matches macOS HUD
-                let approx = max(0.0, min(1.0, startVol + Float(targetOffset) / 64.0))
+                st.lastStepOffset = targetOffset
+                let approx = max(0.0, min(1.0, st.startValue + Float(targetOffset) / 64.0))
                 activeHUD = .volume(value: approx, muted: approx <= 0.004)
                 needsDisplay = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
@@ -436,29 +529,31 @@ final class CockpitView: NSView {
                     self.activeHUD = .volume(value: AudioController.shared.getVolume(), muted: AudioController.shared.isMuted())
                     self.needsDisplay = true
                 }
+            } else if case .none = activeHUD {
+                activeHUD = .volume(value: AudioController.shared.getVolume(), muted: AudioController.shared.isMuted())
+                needsDisplay = true
             }
-            return targetOffset
         } else {
-            let delta = Float((currentX - startX) / 320.0)
-            let target = max(0.0, min(1.0, startVol + delta))
+            let delta = Float(st.accumulatedPx / 320.0)
+            let target = max(0.0, min(1.0, st.startValue + delta))
             AudioController.shared.setVolume(target, showOSD: true)
             let muted = AudioController.shared.isMuted()
             activeHUD = .volume(value: target, muted: muted)
             needsDisplay = true
-            return lastStepOffset
         }
     }
 
-    private func applyBrightnessSlide(currentX: CGFloat, startX: CGFloat, startBright: Float, lastStepOffset: Int) -> Int {
+    private func applyBrightnessSlide(_ st: inout SliderTrackState) {
         hudDismissTimer?.invalidate()
         mediaTickTimer?.invalidate()
 
         if TBIsAccessibilityTrusted(false) {
-            let targetOffset = Int(round((currentX - startX) / 5.5))
-            let diff = targetOffset - lastStepOffset
+            let targetOffset = Int(round(st.accumulatedPx / 5.5))
+            let diff = targetOffset - st.lastStepOffset
             if diff != 0 {
                 _ = BrightnessController.shared.nudgeDisplayBrightnessFine(steps: diff)
-                let approx = max(0.0, min(1.0, startBright + Float(targetOffset) / 64.0))
+                st.lastStepOffset = targetOffset
+                let approx = max(0.0, min(1.0, st.startValue + Float(targetOffset) / 64.0))
                 activeHUD = .brightness(value: approx)
                 needsDisplay = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
@@ -466,14 +561,15 @@ final class CockpitView: NSView {
                     self.activeHUD = .brightness(value: BrightnessController.shared.getDisplayBrightness())
                     self.needsDisplay = true
                 }
+            } else if case .none = activeHUD {
+                activeHUD = .brightness(value: BrightnessController.shared.getDisplayBrightness())
+                needsDisplay = true
             }
-            return targetOffset
         } else {
-            let delta = Float((currentX - startX) / 320.0)
-            let target = BrightnessController.shared.setDisplayBrightness(startBright + delta, showOSD: true)
+            let delta = Float(st.accumulatedPx / 320.0)
+            let target = BrightnessController.shared.setDisplayBrightness(st.startValue + delta, showOSD: true)
             activeHUD = .brightness(value: target)
             needsDisplay = true
-            return lastStepOffset
         }
     }
 
