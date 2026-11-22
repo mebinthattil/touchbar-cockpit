@@ -231,9 +231,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: - Callbacks & Sleep/Wake Resilience
+    private static let terminalBundleIDs: Set<String> = [
+        "com.mitchellh.ghostty",
+        "net.kovidgoyal.kitty",
+        "com.googlecode.iterm2",
+        "dev.warp.Warp-Stable",
+        "com.apple.Terminal"
+    ]
+
     private func setupCallbacks() {
         touchBarController.cockpitView.onToggleKeepAwake = { [weak self] in
             self?.toggleKeepAwake()
+        }
+        touchBarController.cockpitView.onFocusTerminal = {
+            Self.focusRunningTerminal()
+        }
+    }
+
+    private static func isTerminalApp(_ app: NSRunningApplication?) -> Bool {
+        guard let app = app else { return false }
+        if let bid = app.bundleIdentifier, terminalBundleIDs.contains(bid) {
+            return true
+        }
+        if let name = app.localizedName?.lowercased(),
+           name.contains("ghostty") || name == "kitty" || name.contains("iterm") || name == "warp" || name == "terminal" {
+            return true
+        }
+        return false
+    }
+
+    private static func focusRunningTerminal() {
+        let running = NSWorkspace.shared.runningApplications
+        // Prefer Ghostty first, then any other running terminal
+        let priority = ["com.mitchellh.ghostty", "net.kovidgoyal.kitty", "com.googlecode.iterm2", "dev.warp.Warp-Stable", "com.apple.Terminal"]
+        for bid in priority {
+            if let app = running.first(where: { $0.bundleIdentifier == bid }) {
+                app.activate(options: [.activateIgnoringOtherApps])
+                return
+            }
+        }
+        if let app = running.first(where: { isTerminalApp($0) }) {
+            app.activate(options: [.activateIgnoringOtherApps])
         }
     }
 
@@ -241,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let ws = NSWorkspace.shared.notificationCenter
         let reattachSelector = #selector(handleSystemWake)
 
+        ws.addObserver(self, selector: #selector(handleAppActivated(_:)), name: NSWorkspace.didActivateApplicationNotification, object: nil)
         ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.willSleepNotification, object: nil)
         ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.screensDidSleepNotification, object: nil)
         ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
@@ -248,6 +287,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ws.addObserver(self, selector: reattachSelector, name: NSWorkspace.screensDidWakeNotification, object: nil)
         ws.addObserver(self, selector: reattachSelector, name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: reattachSelector, name: NSApplication.didChangeScreenParametersNotification, object: nil)
+    }
+
+    @objc private func handleAppActivated(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        if Self.isTerminalApp(app) {
+            touchBarController.clearWaitingAgent()
+        }
     }
 
     @objc private func handleSystemSleep() {

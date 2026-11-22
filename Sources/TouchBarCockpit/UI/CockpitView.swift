@@ -63,6 +63,12 @@ final class CockpitView: NSView {
     private var waveformBands: [Float] = Array(repeating: 0, count: AudioSpectrumTap.bandCount)
     private var isAudioPlaying: Bool = false
 
+    // Persistent Coding Agent Waiting Banner (replaces M2 Thermal slot after 3s amber flash until terminal focused)
+    private var waitingAgentName: String? = nil
+
+    // Callbacks
+    var onFocusTerminal: (() -> Void)?
+
     // Cached Formatters & Symbol Images (eliminates repeated ICU / bitmap allocations per frame)
     private static let timeFormatter: DateFormatter = {
         let df = DateFormatter()
@@ -165,12 +171,15 @@ final class CockpitView: NSView {
         }
     }
 
-    /// Gently breathes the entire Touch Bar warm amber for 3.0s when a coding agent finishes its turn.
+    /// Gently glows the entire Touch Bar warm amber for a full 3.2s when a coding agent finishes its turn,
+    /// then leaves a persistent amber "Agent Waiting" pill in the M2 Temp slot until a terminal is focused.
     func triggerAgentFlash(agent: String) {
-        // Don't interrupt an active drag/gesture
-        if case .volumeSlide = gestureMode { return }
-        if case .brightnessSlide = gestureMode { return }
-        if case .mediaScrubbing = gestureMode { return }
+        waitingAgentName = agent
+
+        // Don't interrupt an active drag/gesture; still set the persistent badge in M2 Temp slot
+        if case .volumeSlide = gestureMode { needsDisplay = true; return }
+        if case .brightnessSlide = gestureMode { needsDisplay = true; return }
+        if case .mediaScrubbing = gestureMode { needsDisplay = true; return }
 
         hudDismissTimer?.invalidate()
         mediaTickTimer?.invalidate()
@@ -188,7 +197,7 @@ final class CockpitView: NSView {
                 return
             }
             let elapsed = CFAbsoluteTimeGetCurrent() - t0
-            if elapsed >= 3.0 {
+            if elapsed >= 3.2 {
                 self.dismissActiveHUD()
             } else {
                 self.needsDisplay = true
@@ -197,6 +206,16 @@ final class CockpitView: NSView {
         timer.tolerance = 0.008
         RunLoop.main.add(timer, forMode: .common)
         flashAnimTimer = timer
+    }
+
+    func clearWaitingAgent() {
+        guard waitingAgentName != nil else { return }
+        waitingAgentName = nil
+        if case .agentFlash = activeHUD {
+            dismissActiveHUD()
+        } else {
+            needsDisplay = true
+        }
     }
 
     private func openMediaOverlay(togglePlayback: Bool, pinned: Bool) {
@@ -799,6 +818,11 @@ final class CockpitView: NSView {
                 }
             }
         } else if rects.thermal.contains(point) {
+            if waitingAgentName != nil {
+                clearWaitingAgent()
+                onFocusTerminal?()
+                return
+            }
             let peakStr = metrics.socPeakTempC > 0 ? String(format: "Peak %.0f°C", metrics.socPeakTempC) : "Thermal OK"
             let fanPct = metrics.fanMaxRPM > 0 ? Int((metrics.fanRPM / metrics.fanMaxRPM) * 100.0) : 0
             let fanStr = metrics.fanAvailable ? String(format: "Fan %.0f RPM (%d%%)", metrics.fanRPM, fanPct) : "Fan Passive"
@@ -1048,8 +1072,28 @@ final class CockpitView: NSView {
         ctx.restoreGState()
     }
 
-    // MARK: - Panel 3: M2 Thermal & Fan RPM
+    // MARK: - Panel 3: M2 Thermal & Fan RPM (or Persistent Amber "Agent Waiting" Banner)
     private func drawThermalPanel(ctx: CGContext, rect: NSRect) {
+        if let agent = waitingAgentName {
+            let pillRect = rect.insetBy(dx: 4, dy: 2.5)
+            let pillPath = CGPath(roundedRect: pillRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
+            let amber = NSColor(calibratedRed: 0.99, green: 0.66, blue: 0.14, alpha: 1.0)
+
+            ctx.saveGState()
+            ctx.setFillColor(amber.withAlphaComponent(0.24).cgColor)
+            ctx.addPath(pillPath)
+            ctx.fillPath()
+            ctx.setStrokeColor(amber.withAlphaComponent(0.90).cgColor)
+            ctx.setLineWidth(1.1)
+            ctx.addPath(pillPath)
+            ctx.strokePath()
+            ctx.restoreGState()
+
+            drawTextCentered("✦ \(agent.uppercased()) WAITING", centerX: rect.midX, y: 14.5, size: 9.5, weight: .bold, color: NSColor(calibratedRed: 1.0, green: 0.84, blue: 0.42, alpha: 1.0))
+            drawTextCentered("YOUR TURN · OPEN TERMINAL", centerX: rect.midX, y: 4.0, size: 7.2, weight: .semibold, color: amber.withAlphaComponent(0.85))
+            return
+        }
+
         let padX: CGFloat = 7
         let innerW = rect.width - padX * 2
 
@@ -1307,15 +1351,25 @@ final class CockpitView: NSView {
 
     // MARK: - Full-Width Gentle Breathing Amber Flash (Coding Agent Turn Complete)
     private func drawAgentAmberFlash(ctx: CGContext, agent: String, elapsed: TimeInterval) {
-        let duration: Double = 3.0
+        let duration: Double = 3.2
         let t = min(duration, max(0, elapsed))
-        // Two smooth gentle breaths over 3.0s: sin^2(pi * t / 1.5), wrapped in a soft outer fade
-        let breath = sin(.pi * t / 1.5)
-        let intensity = CGFloat(breath * breath) // 0.0 -> 1.0 -> 0.0 -> 1.0 -> 0.0
+
+        // Sustained 3-second envelope: smooth 0.25s ease-in, 2.5s luminous gentle pulse, 0.45s ease-out
+        let envelope: Double
+        if t < 0.25 {
+            envelope = t / 0.25
+        } else if t > 2.75 {
+            envelope = max(0.0, (duration - t) / 0.45)
+        } else {
+            envelope = 1.0
+        }
+        // Gentle breathing modulation between 0.62 and 1.0 during the sustained window
+        let wave = 0.81 + 0.19 * sin(.pi * 2.0 * (t - 0.25) / 1.25 - .pi / 2.0)
+        let intensity = CGFloat(envelope * wave)
 
         // Warm OLED amber gradient across full 1004x30pt width
-        let edgeAmber = NSColor(calibratedRed: 0.90, green: 0.45, blue: 0.04, alpha: 0.14 + 0.58 * intensity).cgColor
-        let midAmber  = NSColor(calibratedRed: 0.99, green: 0.68, blue: 0.12, alpha: 0.20 + 0.72 * intensity).cgColor
+        let edgeAmber = NSColor(calibratedRed: 0.92, green: 0.46, blue: 0.04, alpha: 0.72 * intensity).cgColor
+        let midAmber  = NSColor(calibratedRed: 0.99, green: 0.68, blue: 0.12, alpha: 0.92 * intensity).cgColor
         let cs = CGColorSpaceCreateDeviceRGB()
 
         ctx.saveGState()
@@ -1329,22 +1383,22 @@ final class CockpitView: NSView {
         }
 
         // Subtle luminous top hairline
-        ctx.setFillColor(NSColor(calibratedRed: 1.0, green: 0.86, blue: 0.45, alpha: 0.25 + 0.65 * intensity).cgColor)
+        ctx.setFillColor(NSColor(calibratedRed: 1.0, green: 0.88, blue: 0.50, alpha: 0.90 * intensity).cgColor)
         ctx.fill(CGRect(x: 0, y: bounds.height - 1.5, width: bounds.width, height: 1.5))
         ctx.restoreGState()
 
         // Crisp centered pill label so you immediately know which harness is waiting
         let label = "✦  \(agent.uppercased()) WAITING FOR YOUR TURN"
-        let pillW: CGFloat = 240
+        let pillW: CGFloat = 248
         let pillRect = CGRect(x: bounds.midX - pillW / 2.0, y: 5, width: pillW, height: 20)
         let pillPath = CGPath(roundedRect: pillRect, cornerWidth: 10, cornerHeight: 10, transform: nil)
         ctx.saveGState()
-        ctx.setFillColor(NSColor.black.withAlphaComponent(0.55).cgColor)
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.60 * CGFloat(envelope)).cgColor)
         ctx.addPath(pillPath)
         ctx.fillPath()
         ctx.restoreGState()
 
-        let textColor = NSColor(calibratedRed: 1.0, green: 0.90, blue: 0.65, alpha: 0.65 + 0.35 * intensity)
+        let textColor = NSColor(calibratedRed: 1.0, green: 0.90, blue: 0.65, alpha: CGFloat(envelope))
         drawTextCentered(label, centerX: bounds.midX, y: 8.5, size: 10, weight: .bold, color: textColor)
     }
 

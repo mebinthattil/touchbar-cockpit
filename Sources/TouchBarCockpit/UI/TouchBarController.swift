@@ -88,6 +88,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         cockpitView.triggerAgentFlash(agent: agent)
     }
 
+    func clearWaitingAgent() {
+        cockpitView.clearWaitingAgent()
+    }
+
     // MARK: - NSTouchBarDelegate
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         guard identifier == Self.itemIdentifier else { return nil }
