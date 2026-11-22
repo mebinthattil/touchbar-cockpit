@@ -19,6 +19,8 @@ struct NowPlayingState {
     var isPlaying: Bool = false
     var canSeek: Bool = false
     var artwork: NSImage? = nil
+    var appIcon: NSImage? = nil
+    var appBundleID: String? = nil
     var fetchedAt: Date = Date()
 
     func interpolatedElapsed(at now: Date = Date()) -> Double {
@@ -39,6 +41,16 @@ final class MediaController {
     private var promptedBundles: Set<String> = []
     private var cachedArtworkKey: String = ""
     private var cachedArtworkImage: NSImage? = nil
+    private var appIconCache: [String: NSImage] = [:]
+
+    private func iconForApp(bundleID: String) -> NSImage? {
+        if let hit = appIconCache[bundleID] { return hit }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        icon.size = NSSize(width: 24, height: 24)
+        appIconCache[bundleID] = icon
+        return icon
+    }
 
     // MARK: - Fetch Live Metadata (Apple Music / Spotify / VLC via NSAppleScript + Zen/Chrome/IINA via AXUIElement)
     func fetchNowPlaying(completion: @escaping (NowPlayingState) -> Void) {
@@ -94,10 +106,15 @@ final class MediaController {
                 var fallback = self.lastState
                 fallback.source = .universal
                 fallback.title = frontApp?.localizedName ?? "Now Playing"
-                fallback.artist = "Universal Media"
+                fallback.artist = "Media"
                 fallback.duration = 0
                 fallback.elapsed = 0
                 fallback.canSeek = false
+                fallback.artwork = nil
+                if let bid = frontApp?.bundleIdentifier {
+                    fallback.appBundleID = bid
+                    fallback.appIcon = self.iconForApp(bundleID: bid)
+                }
                 finalState = fallback
             }
 
@@ -232,7 +249,9 @@ final class MediaController {
 
         for app in candidates {
             let appName = app.localizedName ?? "Browser"
-            let bid = app.bundleIdentifier?.lowercased() ?? ""
+            let rawBid = app.bundleIdentifier ?? ""
+            let bid = rawBid.lowercased()
+            let appIcon = !rawBid.isEmpty ? iconForApp(bundleID: rawBid) : nil
             let titles = windowTitles(forPID: app.processIdentifier)
 
             for rawTitle in titles {
@@ -245,6 +264,9 @@ final class MediaController {
                         elapsed: 0,
                         isPlaying: lastState.isPlaying,
                         canSeek: false,
+                        artwork: nil,
+                        appIcon: appIcon,
+                        appBundleID: rawBid,
                         fetchedAt: Date()
                     )
                 }
@@ -259,6 +281,9 @@ final class MediaController {
                         elapsed: 0,
                         isPlaying: lastState.isPlaying,
                         canSeek: false,
+                        artwork: nil,
+                        appIcon: appIcon,
+                        appBundleID: rawBid,
                         fetchedAt: Date()
                     )
                 }
@@ -375,6 +400,8 @@ final class MediaController {
             isPlaying: parts[0].lowercased() == "playing",
             canSeek: dur > 0,
             artwork: art,
+            appIcon: iconForApp(bundleID: "com.spotify.client"),
+            appBundleID: "com.spotify.client",
             fetchedAt: Date()
         )
     }
@@ -412,6 +439,8 @@ final class MediaController {
             isPlaying: parts[0].lowercased() == "playing",
             canSeek: dur > 0,
             artwork: art,
+            appIcon: iconForApp(bundleID: "com.apple.Music"),
+            appBundleID: "com.apple.Music",
             fetchedAt: Date()
         )
     }
@@ -498,6 +527,9 @@ final class MediaController {
             elapsed: pos,
             isPlaying: parts[0].lowercased() == "true",
             canSeek: dur > 0,
+            artwork: nil,
+            appIcon: iconForApp(bundleID: "org.videolan.vlc"),
+            appBundleID: "org.videolan.vlc",
             fetchedAt: Date()
         )
     }

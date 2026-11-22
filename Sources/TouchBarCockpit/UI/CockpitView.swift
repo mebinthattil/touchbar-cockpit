@@ -19,6 +19,8 @@ final class CockpitView: NSView {
     // MARK: - Media Overlay State
     private var mediaState = NowPlayingState()
     private var mediaTickTimer: Timer?
+    private var mediaOverlayStartTime: CFAbsoluteTime = 0
+    private var mediaMarqueeTickCount: Int = 0
     private var mediaPressedButton: MediaButton? = nil
     private var isScrubbingMedia: Bool = false
     private var scrubPreviewFraction: CGFloat = 0
@@ -155,13 +157,20 @@ final class CockpitView: NSView {
         isScrubbingMedia = false
         jogNormalizedOffset = 0
         jogAccumulatedSec = 0
+        mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
+        mediaMarqueeTickCount = 0
         needsDisplay = true
-        scheduleHUDDismiss(after: 8.0)
+        scheduleHUDDismiss(after: 10.0)
 
         let onState: (NowPlayingState) -> Void = { [weak self] state in
             guard let self = self else { return }
+            let trackChanged = (state.title != self.mediaState.title || state.artist != self.mediaState.artist)
             self.mediaState = state
+            if trackChanged {
+                self.mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
+            }
             if case .media = self.activeHUD {
+                self.configureMediaTickTimer()
                 self.needsDisplay = true
             }
         }
@@ -174,16 +183,41 @@ final class CockpitView: NSView {
             MediaController.shared.fetchNowPlaying(completion: onState)
         }
 
-        // Smooth live elapsed ticking while Media Overlay is visible
+        configureMediaTickTimer()
+    }
+
+    /// Runs 30 FPS partial-rect marquee scrolling ONLY when Media Overlay is open AND text overflows;
+    /// otherwise ticks gently at 2 Hz for the elapsed timestamp (and stops completely on dismiss).
+    private func configureMediaTickTimer() {
         mediaTickTimer?.invalidate()
-        let tick = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+        let needsMarquee = mediaNeedsMarquee()
+        let interval: TimeInterval = needsMarquee ? (1.0 / 30.0) : 0.5
+        let tick = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             guard let self = self, case .media = self.activeHUD else { return }
-            if !self.isScrubbingMedia {
+            if self.isScrubbingMedia { return }
+            self.mediaMarqueeTickCount += 1
+            if needsMarquee {
+                // Redraw only the text meta rect at 30 FPS; full redraw every ~0.5s for elapsed timestamp
+                if self.mediaMarqueeTickCount % 15 == 0 {
+                    self.needsDisplay = true
+                } else {
+                    self.setNeedsDisplay(self.mediaOverlayRects(for: self.bounds).meta)
+                }
+            } else {
                 self.needsDisplay = true
             }
         }
+        tick.tolerance = needsMarquee ? 0.008 : 0.08
         RunLoop.main.add(tick, forMode: .common)
         mediaTickTimer = tick
+    }
+
+    private func mediaNeedsMarquee() -> Bool {
+        let r = mediaOverlayRects(for: bounds)
+        let textW = mediaTextClipRect(metaRect: r.meta).width
+        let titleW = measureTextWidth(mediaState.title, size: 10.5, weight: .semibold)
+        let subW = measureTextWidth(mediaSubtitleText(), size: 8.5, weight: .medium)
+        return titleW > textW || subW > textW
     }
 
     // MARK: - Multi-Touch Handling (Pure Eyes-Free Volume, Brightness & Long-Press Media)
@@ -622,25 +656,33 @@ final class CockpitView: NSView {
         case .close:
             dismissActiveHUD()
         case .prev:
-            scheduleHUDDismiss(after: 8.0)
+            scheduleHUDDismiss(after: 10.0)
             MediaController.shared.previousTrack { [weak self] state in
-                self?.mediaState = state
-                self?.needsDisplay = true
+                guard let self = self else { return }
+                self.mediaState = state
+                self.mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
+                self.configureMediaTickTimer()
+                self.needsDisplay = true
             }
         case .playPause:
-            scheduleHUDDismiss(after: 8.0)
+            scheduleHUDDismiss(after: 10.0)
             mediaState.isPlaying.toggle()
             mediaState.fetchedAt = Date()
             needsDisplay = true
             MediaController.shared.togglePlayPause { [weak self] state in
-                self?.mediaState = state
-                self?.needsDisplay = true
+                guard let self = self else { return }
+                self.mediaState = state
+                self.configureMediaTickTimer()
+                self.needsDisplay = true
             }
         case .next:
-            scheduleHUDDismiss(after: 8.0)
+            scheduleHUDDismiss(after: 10.0)
             MediaController.shared.nextTrack { [weak self] state in
-                self?.mediaState = state
-                self?.needsDisplay = true
+                guard let self = self else { return }
+                self.mediaState = state
+                self.mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
+                self.configureMediaTickTimer()
+                self.needsDisplay = true
             }
         case .skipBack:
             scheduleHUDDismiss(after: 8.0)
@@ -1220,7 +1262,7 @@ final class CockpitView: NSView {
         let closeR = NSRect(x: rect.width - padX - closeW, y: btnY, width: closeW, height: btnH)
 
         let metaX = nextR.maxX + 10
-        let metaW: CGFloat = min(228, max(140, rect.width * 0.225))
+        let metaW: CGFloat = min(256, max(160, rect.width * 0.255))
         let metaR = NSRect(x: metaX, y: 0, width: metaW, height: h)
 
         let scrubAreaX = metaR.maxX + 10
@@ -1275,9 +1317,9 @@ final class CockpitView: NSView {
         )
         drawMediaButton(ctx: ctx, rect: r.next, symbol: "forward.fill", pressed: mediaPressedButton == .next, accent: nil)
 
-        // Track Metadata (Optional 26x26 rounded Album Art + Title + Artist · Source)
-        var textX = r.meta.minX
-        var textW = r.meta.width
+        // Track Metadata: [26x26 Album Cover]  [Marquee Title / Artist]  [24x24 Playing App Logo]
+        let textRect = mediaTextClipRect(metaRect: r.meta)
+
         if let art = mediaState.artwork {
             let artSize: CGFloat = 26
             let artRect = CGRect(x: r.meta.minX, y: (bounds.height - artSize) / 2.0, width: artSize, height: artSize)
@@ -1294,24 +1336,37 @@ final class CockpitView: NSView {
             ctx.addPath(artPath)
             ctx.strokePath()
             ctx.restoreGState()
-
-            textX = artRect.maxX + 7
-            textW = max(50, r.meta.maxX - textX)
         }
 
-        let titleClip = truncateText(mediaState.title, maxWidth: textW, size: 10.5, weight: .semibold)
-        drawText(titleClip, at: NSPoint(x: textX, y: 15.5), size: 10.5, weight: .semibold, color: .white)
-
-        let subRaw: String
-        if !mediaState.artist.isEmpty && mediaState.source != .universal {
-            subRaw = "\(mediaState.artist) · \(mediaState.source.rawValue)"
-        } else if !mediaState.artist.isEmpty {
-            subRaw = mediaState.artist
-        } else {
-            subRaw = mediaState.source.rawValue
+        // Right-side symmetric Playing App Logo (Apple Music / Spotify / Zen / IINA / VLC)
+        if let appLogo = mediaState.appIcon {
+            let logoSize: CGFloat = 24
+            let logoRect = CGRect(x: r.meta.maxX - logoSize, y: (bounds.height - logoSize) / 2.0, width: logoSize, height: logoSize)
+            appLogo.draw(in: logoRect)
         }
-        let subClip = truncateText(subRaw, maxWidth: textW, size: 8.5, weight: .medium)
-        drawText(subClip, at: NSPoint(x: textX, y: 3.5), size: 8.5, weight: .medium, color: NSColor(calibratedWhite: 0.55, alpha: 1.0))
+
+        // Marquee-scrolling Title & Subtitle (pauses 1.5s, then smoothly scrolls if overflowing!)
+        let elapsedSinceOpen = max(0, CFAbsoluteTimeGetCurrent() - mediaOverlayStartTime)
+        drawMarqueeText(
+            ctx: ctx,
+            text: mediaState.title,
+            clipRect: CGRect(x: textRect.minX, y: 14.5, width: textRect.width, height: 14.5),
+            y: 15.5,
+            size: 10.5,
+            weight: .semibold,
+            color: .white,
+            elapsed: elapsedSinceOpen
+        )
+        drawMarqueeText(
+            ctx: ctx,
+            text: mediaSubtitleText(),
+            clipRect: CGRect(x: textRect.minX, y: 1.5, width: textRect.width, height: 13.0),
+            y: 3.5,
+            size: 8.5,
+            weight: .medium,
+            color: NSColor(calibratedWhite: 0.56, alpha: 1.0),
+            elapsed: elapsedSinceOpen
+        )
 
         // Interactive Media Scrubber
         if mediaState.canSeek && mediaState.duration > 0 {
@@ -1419,6 +1474,87 @@ final class CockpitView: NSView {
                 height: sz.height
             ))
         }
+    }
+
+    private func mediaTextClipRect(metaRect: NSRect) -> CGRect {
+        let leftInset: CGFloat = (mediaState.artwork != nil) ? 33.0 : 0.0
+        let rightInset: CGFloat = (mediaState.appIcon != nil) ? 31.0 : 0.0
+        let x = metaRect.minX + leftInset
+        let w = max(44.0, metaRect.width - leftInset - rightInset)
+        return CGRect(x: x, y: metaRect.minY, width: w, height: metaRect.height)
+    }
+
+    private func mediaSubtitleText() -> String {
+        if !mediaState.artist.isEmpty {
+            return mediaState.artist
+        }
+        return mediaState.source.rawValue
+    }
+
+    private func measureTextWidth(_ text: String, size: CGFloat, weight: NSFont.Weight) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: size, weight: weight)
+        return (text as NSString).size(withAttributes: [.font: font]).width
+    }
+
+    /// Spotify / iOS-style marquee text: displays stationary for 1.5s, then smoothly scrolls
+    /// in a seamless loop with subtle OLED black edge fades whenever the text overflows clipRect.
+    private func drawMarqueeText(ctx: CGContext, text: String, clipRect: CGRect, y: CGFloat, size: CGFloat, weight: NSFont.Weight, color: NSColor, elapsed: TimeInterval) {
+        let font = NSFont.systemFont(ofSize: size, weight: weight)
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        let textW = (text as NSString).size(withAttributes: attrs).width
+
+        ctx.saveGState()
+        ctx.clip(to: clipRect)
+
+        if textW <= clipRect.width {
+            (text as NSString).draw(at: NSPoint(x: clipRect.minX, y: y), withAttributes: attrs)
+            ctx.restoreGState()
+            return
+        }
+
+        let pauseDuration: Double = 1.5
+        let speedPtsPerSec: Double = 28.0
+        let gap: CGFloat = 36.0
+        let cycleDist = Double(textW + gap)
+        let scrollDuration = cycleDist / speedPtsPerSec
+        let totalCycle = pauseDuration + scrollDuration
+
+        let phase = elapsed.truncatingRemainder(dividingBy: totalCycle)
+        let offset: CGFloat
+        if phase < pauseDuration {
+            offset = 0
+        } else {
+            offset = CGFloat((phase - pauseDuration) * speedPtsPerSec)
+        }
+
+        (text as NSString).draw(at: NSPoint(x: clipRect.minX - offset, y: y), withAttributes: attrs)
+        if offset > 0 {
+            (text as NSString).draw(at: NSPoint(x: clipRect.minX - offset + textW + gap, y: y), withAttributes: attrs)
+        }
+
+        // Subtle OLED black edge fade on right (and left while actively scrolling)
+        let fadeW: CGFloat = 8.0
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let clearBlack = NSColor.black.withAlphaComponent(0.0).cgColor
+        let solidBlack = NSColor.black.cgColor
+        if let rightGrad = CGGradient(colorsSpace: cs, colors: [clearBlack, solidBlack] as CFArray, locations: [0, 1]) {
+            ctx.drawLinearGradient(
+                rightGrad,
+                start: CGPoint(x: clipRect.maxX - fadeW, y: clipRect.midY),
+                end: CGPoint(x: clipRect.maxX, y: clipRect.midY),
+                options: []
+            )
+        }
+        if offset > 1.0, let leftGrad = CGGradient(colorsSpace: cs, colors: [solidBlack, clearBlack] as CFArray, locations: [0, 1]) {
+            ctx.drawLinearGradient(
+                leftGrad,
+                start: CGPoint(x: clipRect.minX, y: clipRect.midY),
+                end: CGPoint(x: clipRect.minX + fadeW, y: clipRect.midY),
+                options: []
+            )
+        }
+
+        ctx.restoreGState()
     }
 
     private func truncateText(_ text: String, maxWidth: CGFloat, size: CGFloat, weight: NSFont.Weight) -> String {
