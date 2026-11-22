@@ -23,6 +23,7 @@ final class CockpitView: NSView {
     private var mediaTickTimer: Timer?
     private var mediaOverlayStartTime: CFAbsoluteTime = 0
     private var mediaMarqueeTickCount: Int = 0
+    private var isMediaOverlayPinned: Bool = false
     private var mediaPressedButton: MediaButton? = nil
     private var isScrubbingMedia: Bool = false
     private var scrubPreviewFraction: CGFloat = 0
@@ -150,8 +151,18 @@ final class CockpitView: NSView {
         flashAnimTimer = nil
         mediaPressedButton = nil
         isScrubbingMedia = false
+        isMediaOverlayPinned = false
         activeHUD = .none
         needsDisplay = true
+    }
+
+    private func resetMediaAutoDismissIfNeeded() {
+        if isMediaOverlayPinned {
+            hudDismissTimer?.invalidate()
+            hudDismissTimer = nil
+        } else {
+            scheduleHUDDismiss(after: 10.0)
+        }
     }
 
     /// Gently breathes the entire Touch Bar warm amber for 3.0s when a coding agent finishes its turn.
@@ -188,9 +199,10 @@ final class CockpitView: NSView {
         flashAnimTimer = timer
     }
 
-    private func openMediaOverlay(togglePlayback: Bool) {
+    private func openMediaOverlay(togglePlayback: Bool, pinned: Bool) {
         cancelLongPress()
         activeHUD = .media
+        isMediaOverlayPinned = pinned
         mediaPressedButton = nil
         isScrubbingMedia = false
         jogNormalizedOffset = 0
@@ -198,7 +210,7 @@ final class CockpitView: NSView {
         mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
         mediaMarqueeTickCount = 0
         needsDisplay = true
-        scheduleHUDDismiss(after: 10.0)
+        resetMediaAutoDismissIfNeeded()
 
         let onState: (NowPlayingState) -> Void = { [weak self] state in
             guard let self = self else { return }
@@ -230,10 +242,26 @@ final class CockpitView: NSView {
         mediaTickTimer?.invalidate()
         let needsMarquee = mediaNeedsMarquee()
         let interval: TimeInterval = needsMarquee ? (1.0 / 30.0) : 0.5
+        let metadataRefreshEvery = needsMarquee ? 90 : 6 // Refresh track/art every ~3s while pinned
         let tick = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             guard let self = self, case .media = self.activeHUD else { return }
             if self.isScrubbingMedia { return }
             self.mediaMarqueeTickCount += 1
+
+            // Keep track title, album cover, and duration live if song advances while pinned open
+            if self.isMediaOverlayPinned && self.mediaMarqueeTickCount % metadataRefreshEvery == 0 {
+                MediaController.shared.fetchNowPlaying { [weak self] state in
+                    guard let self = self, case .media = self.activeHUD else { return }
+                    let changed = (state.title != self.mediaState.title || state.artist != self.mediaState.artist)
+                    self.mediaState = state
+                    if changed {
+                        self.mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
+                        self.configureMediaTickTimer()
+                    }
+                    self.needsDisplay = true
+                }
+            }
+
             if needsMarquee {
                 // Redraw only the text meta rect at 30 FPS; full redraw every ~0.5s for elapsed timestamp
                 if self.mediaMarqueeTickCount % 15 == 0 {
@@ -290,7 +318,7 @@ final class CockpitView: NSView {
             // If Media Overlay is currently open, route 1-finger touches directly to Media controls / scrubber
             if case .media = activeHUD {
                 let mRects = mediaOverlayRects(for: bounds)
-                scheduleHUDDismiss(after: 8.0)
+                resetMediaAutoDismissIfNeeded()
 
                 if mRects.prev.contains(pt) {
                     mediaPressedButton = .prev
@@ -354,7 +382,7 @@ final class CockpitView: NSView {
                 guard let self = self else { return }
                 if case .pendingTap = self.gestureMode, self.peakTouchCount == 1 {
                     self.gestureMode = .longPressConsumed
-                    self.openMediaOverlay(togglePlayback: true)
+                    self.openMediaOverlay(togglePlayback: true, pinned: false)
                 }
             }
             longPressWorkItem = work
@@ -575,14 +603,14 @@ final class CockpitView: NSView {
                     self?.needsDisplay = true
                 }
             }
-            scheduleHUDDismiss(after: 8.0)
+            resetMediaAutoDismissIfNeeded()
             needsDisplay = true
 
         case .mediaJogScrubbing:
             isScrubbingMedia = false
             jogNormalizedOffset = 0
             jogAccumulatedSec = 0
-            scheduleHUDDismiss(after: 8.0)
+            resetMediaAutoDismissIfNeeded()
             needsDisplay = true
 
         case .longPressConsumed:
@@ -694,7 +722,7 @@ final class CockpitView: NSView {
         case .close:
             dismissActiveHUD()
         case .prev:
-            scheduleHUDDismiss(after: 10.0)
+            resetMediaAutoDismissIfNeeded()
             MediaController.shared.previousTrack { [weak self] state in
                 guard let self = self else { return }
                 self.mediaState = state
@@ -703,7 +731,7 @@ final class CockpitView: NSView {
                 self.needsDisplay = true
             }
         case .playPause:
-            scheduleHUDDismiss(after: 10.0)
+            resetMediaAutoDismissIfNeeded()
             mediaState.isPlaying.toggle()
             mediaState.fetchedAt = Date()
             needsDisplay = true
@@ -714,7 +742,7 @@ final class CockpitView: NSView {
                 self.needsDisplay = true
             }
         case .next:
-            scheduleHUDDismiss(after: 10.0)
+            resetMediaAutoDismissIfNeeded()
             MediaController.shared.nextTrack { [weak self] state in
                 guard let self = self else { return }
                 self.mediaState = state
@@ -723,10 +751,10 @@ final class CockpitView: NSView {
                 self.needsDisplay = true
             }
         case .skipBack:
-            scheduleHUDDismiss(after: 8.0)
+            resetMediaAutoDismissIfNeeded()
             MediaController.shared.seekRelative(deltaSeconds: -10.0)
         case .skipFwd:
-            scheduleHUDDismiss(after: 8.0)
+            resetMediaAutoDismissIfNeeded()
             MediaController.shared.seekRelative(deltaSeconds: 10.0)
         }
     }
@@ -801,7 +829,7 @@ final class CockpitView: NSView {
             let netFlags = flags.isEmpty ? "Direct (No VPN/Proxy)" : flags.joined(separator: " · ")
             showTransientToast(title: "NETWORK", detail: "↓ \(formatSpeed(metrics.netDownBps))   ↑ \(formatSpeed(metrics.netUpBps))   ·   \(netFlags)", accent: NSColor(calibratedRed: 0.65, green: 0.55, blue: 0.98, alpha: 1.0), duration: 3.0)
         } else if rects.clock.contains(point) {
-            openMediaOverlay(togglePlayback: false)
+            openMediaOverlay(togglePlayback: false, pinned: true)
         }
     }
 
