@@ -362,11 +362,11 @@ final class MediaController {
             if let bid = self.lastState.appBundleID, runningIDs.contains(bid) {
                 switch self.lastState.source {
                 case .spotify:
-                    handled = (self.runInProcessAppleScript("tell application \"Spotify\" to playpause") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"Spotify\" to playpause")
                 case .music:
-                    handled = (self.runInProcessAppleScript("tell application \"Music\" to playpause") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"Music\" to playpause")
                 case .vlc:
-                    handled = (self.runInProcessAppleScript("tell application \"VLC\" to play") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"VLC\" to play")
                 default:
                     break
                 }
@@ -395,11 +395,11 @@ final class MediaController {
             if let bid = self.lastState.appBundleID, runningIDs.contains(bid) {
                 switch self.lastState.source {
                 case .spotify:
-                    handled = (self.runInProcessAppleScript("tell application \"Spotify\" to next track") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"Spotify\" to next track")
                 case .music:
-                    handled = (self.runInProcessAppleScript("tell application \"Music\" to next track") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"Music\" to next track")
                 case .vlc:
-                    handled = (self.runInProcessAppleScript("tell application \"VLC\" to next") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"VLC\" to next")
                 default:
                     break
                 }
@@ -426,11 +426,11 @@ final class MediaController {
             if let bid = self.lastState.appBundleID, runningIDs.contains(bid) {
                 switch self.lastState.source {
                 case .spotify:
-                    handled = (self.runInProcessAppleScript("tell application \"Spotify\" to previous track") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"Spotify\" to previous track")
                 case .music:
-                    handled = (self.runInProcessAppleScript("tell application \"Music\" to previous track") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"Music\" to previous track")
                 case .vlc:
-                    handled = (self.runInProcessAppleScript("tell application \"VLC\" to previous") != nil)
+                    handled = self.runAppleScriptCommand("tell application \"VLC\" to previous")
                 default:
                     break
                 }
@@ -869,5 +869,13 @@ final class MediaController {
         let result = script.executeAndReturnError(&err)
         guard err == nil else { return nil }
         return result.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Executes a void AppleScript command (e.g. playpause / next track) where stringValue is nil on success.
+    private func runAppleScriptCommand(_ source: String) -> Bool {
+        guard let script = NSAppleScript(source: source) else { return false }
+        var err: NSDictionary?
+        script.executeAndReturnError(&err)
+        return err == nil
     }
 }
