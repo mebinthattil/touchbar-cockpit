@@ -53,6 +53,18 @@ typedef struct {
 
 TBFanInfo TBReadFanInfo(void);
 
+// MARK: - AppleSMC Real-Time 1Hz Power Telemetry (PSTR / PDTR / PPBR)
+typedef struct {
+    BOOL hasSystemTotal;
+    double systemTotalWatts;
+    BOOL hasDCIn;
+    double dcInWatts;
+    BOOL hasBatteryPower;
+    double batteryPowerWatts;
+} TBSMCPowerInfo;
+
+TBSMCPowerInfo TBReadSMCPowerInfo(void);
+
 NS_ASSUME_NONNULL_END
 
 #endif /* PRIVATE_APIS_H */

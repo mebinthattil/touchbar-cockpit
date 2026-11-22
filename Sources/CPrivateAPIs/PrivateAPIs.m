@@ -553,3 +553,34 @@ TBFanInfo TBReadFanInfo(void) {
     }
     return info;
 }
+
+TBSMCPowerInfo TBReadSMCPowerInfo(void) {
+    TBSMCPowerInfo info;
+    memset(&info, 0, sizeof(info));
+    io_connect_t conn = TBSMCConnection();
+    if (conn == 0) return info;
+
+    SMCKeyData_t d;
+    if (TBSMCReadKey(conn, "PSTR", &d)) {
+        double v = TBSMCDecodeNumber(&d);
+        if (v >= 0.0 && v < 300.0) {
+            info.hasSystemTotal = YES;
+            info.systemTotalWatts = v;
+        }
+    }
+    if (TBSMCReadKey(conn, "PDTR", &d)) {
+        double v = TBSMCDecodeNumber(&d);
+        if (v >= 0.0 && v < 300.0) {
+            info.hasDCIn = YES;
+            info.dcInWatts = v;
+        }
+    }
+    if (TBSMCReadKey(conn, "PPBR", &d)) {
+        double v = TBSMCDecodeNumber(&d);
+        if (v > -200.0 && v < 200.0) {
+            info.hasBatteryPower = YES;
+            info.batteryPowerWatts = v;
+        }
+    }
+    return info;
+}

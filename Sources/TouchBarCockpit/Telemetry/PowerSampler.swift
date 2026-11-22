@@ -1,5 +1,6 @@
 import Foundation
 import IOKit
+import CPrivateAPIs
 
 final class PowerSampler {
     struct Sample {
@@ -46,20 +47,35 @@ final class PowerSampler {
             adapterMaxWatts = w
         }
 
-        // Read both live SystemLoad (power system is drawing) and SystemPowerIn (power pulled from charger)
+        // 1. Prefer real-time 1Hz AppleSMC hardware sensors (PSTR = System Draw, PDTR = Charger DC-In, PPBR = Battery)
+        //    instead of AppleSmartBattery's PowerTelemetryData which only refreshes every ~30s.
+        let smcPower = TBReadSMCPowerInfo()
+
         var sysDrawWatts: Double = 0
         var chargerInWatts: Double = 0
         var batteryNetWatts: Double = 0
 
+        if smcPower.hasSystemTotal.boolValue && smcPower.systemTotalWatts > 0.05 {
+            sysDrawWatts = smcPower.systemTotalWatts
+        }
+        if smcPower.hasDCIn.boolValue && external {
+            chargerInWatts = smcPower.dcInWatts
+        }
+        if smcPower.hasBatteryPower.boolValue {
+            // PPBR is unsigned magnitude on some SMC firmwares; sign matches charging/discharging state
+            let mag = abs(smcPower.batteryPowerWatts)
+            batteryNetWatts = charging ? mag : (external ? (chargerInWatts - sysDrawWatts) : -mag)
+        }
+
+        // 2. Fallback to AppleSmartBattery PowerTelemetryData if any SMC key is unavailable
         if let telemetry = dict["PowerTelemetryData"] as? [String: Any] {
-            if let sysLoad = telemetry["SystemLoad"] as? Int, sysLoad > 0 {
+            if sysDrawWatts <= 0.05, let sysLoad = telemetry["SystemLoad"] as? Int, sysLoad > 0 {
                 sysDrawWatts = Double(sysLoad) / 1000.0
             }
-            if let sysIn = telemetry["SystemPowerIn"] as? Int, sysIn > 0 {
+            if !smcPower.hasDCIn.boolValue, external, let sysIn = telemetry["SystemPowerIn"] as? Int, sysIn > 0 {
                 chargerInWatts = Double(sysIn) / 1000.0
             }
-            if let battPwr = telemetry["BatteryPower"] as? Int {
-                // Signed integer in mW (positive = charging battery, negative = discharging)
+            if !smcPower.hasBatteryPower.boolValue, let battPwr = telemetry["BatteryPower"] as? Int {
                 let signedPwr = Int64(Int32(truncatingIfNeeded: battPwr))
                 batteryNetWatts = Double(signedPwr) / 1000.0
             }
