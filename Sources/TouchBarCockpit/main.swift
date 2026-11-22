@@ -13,6 +13,15 @@ if let flashIdx = CommandLine.arguments.firstIndex(of: "--flash") {
     exit(0)
 }
 
+// Utility CLI to render crisp 2x Retina preview screenshots for documentation
+if let shotIdx = CommandLine.arguments.firstIndex(of: "--render-screenshots") {
+    let dir = (shotIdx + 1 < CommandLine.arguments.count) ? CommandLine.arguments[shotIdx + 1] : "docs/screenshots"
+    let app = NSApplication.shared
+    app.setActivationPolicy(.prohibited)
+    CockpitView.renderPreviewScreenshots(to: dir)
+    exit(0)
+}
+
 // Single-instance check (avoid stacking duplicate modal Touch Bars)
 let myPID = ProcessInfo.processInfo.processIdentifier
 if let bundleID = Bundle.main.bundleIdentifier {

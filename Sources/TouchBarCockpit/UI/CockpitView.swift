@@ -1908,4 +1908,158 @@ final class CockpitView: NSView {
     private func formatSpeed(_ bps: Double) -> String {
         return formatSpeedCompact(bps) + "/s"
     }
+
+    // MARK: - Offscreen Retina Preview Renderer (for README screenshots)
+    static func renderPreviewScreenshots(to outDir: String) {
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+
+        let view = CockpitView(frame: NSRect(x: 0, y: 0, width: 1004, height: 30))
+
+        // Realistic Apple Silicon M2 sample telemetry
+        var m = SystemMetrics()
+        m.cpuTotal = 41
+        m.eCoreCount = 4
+        m.coreLoads = [28, 35, 22, 40, 74, 62, 58, 49]
+        m.cpuHistory = [18, 22, 20, 26, 31, 28, 34, 42, 48, 52, 45, 38, 35, 40, 56, 68, 72, 64, 58, 49, 44, 39, 43, 51, 47, 42, 36, 33, 38, 46, 54, 61, 58, 49, 44, 41, 37, 35, 39, 44, 48, 43, 40, 42, 46, 44, 41, 41]
+        m.memUsedGB = 11.6
+        m.memTotalGB = 16
+        m.memActiveFrac = 0.44
+        m.memWiredFrac = 0.16
+        m.memCompressedFrac = 0.12
+        m.swapUsedGB = 0.0
+        m.socTempC = 58
+        m.socPeakTempC = 63
+        m.fanAvailable = true
+        m.fanRPM = 2150
+        m.fanMaxRPM = 7200
+        m.powerWatts = 14.2
+        m.chargerInWatts = 36.8
+        m.batteryNetWatts = 22.6
+        m.adapterMaxWatts = 45
+        m.batteryPercent = 84
+        m.isPluggedIn = true
+        m.isCharging = true
+        m.netDownBps = 2.4 * 1024 * 1024
+        m.netUpBps = 185 * 1024
+        m.netDownHistory = [120, 240, 310, 480, 920, 1400, 1850, 2200, 1950, 1600, 1100, 840, 620, 950, 1500, 2450, 2800, 2300, 1900, 1700, 1450, 1200, 1650, 2100, 2500, 2250, 1800, 1550, 1300, 1750, 2200, 2600, 2400, 2100, 2350, 2450].map { $0 * 1024.0 }
+        m.netUpHistory = [40, 65, 80, 110, 140, 210, 190, 160, 130, 120, 95, 110, 150, 220, 280, 240, 190, 170, 150, 130, 140, 180, 210, 250, 220, 190, 160, 145, 175, 205, 195, 180, 165, 175, 190, 185].map { $0 * 1024.0 }
+        m.tailscaleActive = true
+        m.vpnActive = true
+        m.proxyActive = false
+        m.timestamp = Date()
+
+        func saveFramed(_ filename: String) {
+            let scale: CGFloat = 2.0
+            let barW: CGFloat = 1004
+            let barH: CGFloat = 30
+            let padX: CGFloat = 20
+            let padY: CGFloat = 14
+            let outW = Int((barW + padX * 2) * scale)
+            let outH = Int((barH + padY * 2) * scale)
+
+            guard let barRep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+            barRep.size = view.bounds.size
+            view.cacheDisplay(in: view.bounds, to: barRep)
+            guard let barCG = barRep.cgImage else { return }
+
+            let cs = CGColorSpaceCreateDeviceRGB()
+            guard let ctx = CGContext(data: nil, width: outW, height: outH, bitsPerComponent: 8, bytesPerRow: 0, space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+            ctx.scaleBy(x: scale, y: scale)
+
+            // Sleek space-gray MacBook chassis frame
+            let fullRect = CGRect(x: 0, y: 0, width: barW + padX * 2, height: barH + padY * 2)
+            let chassisPath = CGPath(roundedRect: fullRect, cornerWidth: 14, cornerHeight: 14, transform: nil)
+            ctx.saveGState()
+            ctx.addPath(chassisPath)
+            ctx.clip()
+            let topC = NSColor(calibratedRed: 0.13, green: 0.14, blue: 0.17, alpha: 1.0).cgColor
+            let botC = NSColor(calibratedRed: 0.09, green: 0.10, blue: 0.12, alpha: 1.0).cgColor
+            if let g = CGGradient(colorsSpace: cs, colors: [topC, botC] as CFArray, locations: [0, 1]) {
+                ctx.drawLinearGradient(g, start: CGPoint(x: 0, y: fullRect.maxY), end: CGPoint(x: 0, y: 0), options: [])
+            }
+            ctx.restoreGState()
+
+            // Recessed OLED Touch Bar bezel
+            let barRect = CGRect(x: padX, y: padY, width: barW, height: barH)
+            let barPath = CGPath(roundedRect: barRect, cornerWidth: 5, cornerHeight: 5, transform: nil)
+            ctx.saveGState()
+            ctx.addPath(barPath)
+            ctx.clip()
+            ctx.draw(barCG, in: barRect)
+            ctx.restoreGState()
+
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.12).cgColor)
+            ctx.setLineWidth(0.75)
+            ctx.addPath(barPath)
+            ctx.strokePath()
+            ctx.restoreGState()
+
+            if let outCG = ctx.makeImage(),
+               let png = NSBitmapImageRep(cgImage: outCG).representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: outDir + "/" + filename))
+            }
+        }
+
+        // 1. Cockpit + Live Dynamic Island Waveform
+        view.metrics = m
+        view.activeHUD = .none
+        view.waitingAgentName = nil
+        view.isAudioPlaying = true
+        view.waveformBands = [0.68, 0.92, 0.56, 0.84, 0.42, 0.64]
+        saveFramed("cockpit-waveform.png")
+
+        // 2. Cockpit + Clock + Persistent Agent Waiting Badge
+        view.isAudioPlaying = false
+        view.waitingAgentName = "Claude"
+        saveFramed("cockpit-agent-waiting.png")
+        view.waitingAgentName = nil
+
+        // 3. Full-Width Gentle Amber Agent Alert
+        view.activeHUD = .agentFlash(agent: "Claude", startTime: CFAbsoluteTimeGetCurrent() - 1.2)
+        saveFramed("agent-flash.png")
+
+        // 4. Full-Width Media Overlay (with synthetic vibrant album art + Apple Music icon)
+        let artSize = 52
+        let artCS = CGColorSpaceCreateDeviceRGB()
+        var sampleArt: NSImage? = nil
+        if let actx = CGContext(data: nil, width: artSize, height: artSize, bitsPerComponent: 8, bytesPerRow: 0, space: artCS, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+            let c1 = NSColor(calibratedRed: 0.14, green: 0.36, blue: 0.88, alpha: 1.0).cgColor
+            let c2 = NSColor(calibratedRed: 0.88, green: 0.24, blue: 0.52, alpha: 1.0).cgColor
+            if let g = CGGradient(colorsSpace: artCS, colors: [c1, c2] as CFArray, locations: [0, 1]) {
+                actx.drawLinearGradient(g, start: CGPoint(x: 0, y: 52), end: CGPoint(x: 52, y: 0), options: [])
+            }
+            actx.setFillColor(NSColor.white.withAlphaComponent(0.28).cgColor)
+            actx.fillEllipse(in: CGRect(x: 10, y: 10, width: 32, height: 32))
+            if let cg = actx.makeImage() {
+                sampleArt = NSImage(cgImage: cg, size: NSSize(width: 26, height: 26))
+            }
+        }
+        var musicIcon: NSImage? = nil
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Music") {
+            musicIcon = NSWorkspace.shared.icon(forFile: url.path)
+            musicIcon?.size = NSSize(width: 24, height: 24)
+        }
+        view.mediaState = NowPlayingState(
+            source: .music,
+            title: "Midnight City",
+            artist: "M83",
+            duration: 243,
+            elapsed: 108,
+            isPlaying: true,
+            canSeek: true,
+            artwork: sampleArt,
+            appIcon: musicIcon,
+            appBundleID: "com.apple.Music",
+            fetchedAt: Date()
+        )
+        view.mediaOverlayStartTime = CFAbsoluteTimeGetCurrent()
+        view.activeHUD = .media
+        saveFramed("media-overlay.png")
+
+        // 5. Eyes-Free Volume Slider HUD
+        view.activeHUD = .volume(value: 0.68, muted: false)
+        saveFramed("slider-volume.png")
+    }
 }

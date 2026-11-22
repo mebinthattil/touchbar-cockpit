@@ -3,8 +3,10 @@
 # while also flashing TouchBarCockpit gentle amber for 3s.
 set -u
 
-APP_BIN="/Users/mebin/Downloads/Work/Coding Projects/touchbar-cockpit/build/TouchBarCockpit.app/Contents/MacOS/TouchBarCockpit"
-SKY_BIN="/Users/mebin/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+APP_BIN="$ROOT_DIR/build/TouchBarCockpit.app/Contents/MacOS/TouchBarCockpit"
+SKY_BIN="$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
 
 if [[ -x "$APP_BIN" ]]; then
     "$APP_BIN" --flash "Codex" >/dev/null 2>&1 &

@@ -4,7 +4,9 @@
 set -u
 
 AGENT="${1:-Agent}"
-APP_BIN="/Users/mebin/Downloads/Work/Coding Projects/touchbar-cockpit/build/TouchBarCockpit.app/Contents/MacOS/TouchBarCockpit"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+APP_BIN="$ROOT_DIR/build/TouchBarCockpit.app/Contents/MacOS/TouchBarCockpit"
 
 # Drain stdin (required by agy/claude hook contracts) and skip flash if user manually canceled
 PAYLOAD=""
