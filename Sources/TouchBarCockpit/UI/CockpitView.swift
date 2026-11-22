@@ -1051,8 +1051,8 @@ final class CockpitView: NSView {
         let downStr = "↓" + formatSpeedCompact(metrics.netDownBps)
         let upStr = "↑" + formatSpeedCompact(metrics.netUpBps)
 
-        drawText(downStr, at: NSPoint(x: rect.minX + padX, y: 16.5), size: 9.5, weight: .semibold, color: downColor, mono: true)
-        drawText(upStr, at: NSPoint(x: rect.minX + padX + 54, y: 16.5), size: 9.5, weight: .semibold, color: upColor, mono: true)
+        drawText(downStr, at: NSPoint(x: rect.minX + padX, y: 16.5), size: 9.0, weight: .semibold, color: downColor, mono: true)
+        drawText(upStr, at: NSPoint(x: rect.minX + padX + 57, y: 16.5), size: 9.0, weight: .semibold, color: upColor, mono: true)
 
         // Status indicator dots on top-right (only bright when active)
         var dotX = rect.maxX - padX
@@ -1219,8 +1219,8 @@ final class CockpitView: NSView {
         let closeW: CGFloat = 38
         let closeR = NSRect(x: rect.width - padX - closeW, y: btnY, width: closeW, height: btnH)
 
-        let metaX = nextR.maxX + 12
-        let metaW: CGFloat = min(200, max(120, rect.width * 0.19))
+        let metaX = nextR.maxX + 10
+        let metaW: CGFloat = min(228, max(140, rect.width * 0.225))
         let metaR = NSRect(x: metaX, y: 0, width: metaW, height: h)
 
         let scrubAreaX = metaR.maxX + 10
@@ -1275,9 +1275,32 @@ final class CockpitView: NSView {
         )
         drawMediaButton(ctx: ctx, rect: r.next, symbol: "forward.fill", pressed: mediaPressedButton == .next, accent: nil)
 
-        // Track Metadata (Title + Artist · Source)
-        let titleClip = truncateText(mediaState.title, maxWidth: r.meta.width, size: 10.5, weight: .semibold)
-        drawText(titleClip, at: NSPoint(x: r.meta.minX, y: 15.5), size: 10.5, weight: .semibold, color: .white)
+        // Track Metadata (Optional 26x26 rounded Album Art + Title + Artist · Source)
+        var textX = r.meta.minX
+        var textW = r.meta.width
+        if let art = mediaState.artwork {
+            let artSize: CGFloat = 26
+            let artRect = CGRect(x: r.meta.minX, y: (bounds.height - artSize) / 2.0, width: artSize, height: artSize)
+            let artPath = CGPath(roundedRect: artRect, cornerWidth: 4.5, cornerHeight: 4.5, transform: nil)
+            ctx.saveGState()
+            ctx.addPath(artPath)
+            ctx.clip()
+            art.draw(in: artRect)
+            ctx.restoreGState()
+
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.22).cgColor)
+            ctx.setLineWidth(0.75)
+            ctx.addPath(artPath)
+            ctx.strokePath()
+            ctx.restoreGState()
+
+            textX = artRect.maxX + 7
+            textW = max(50, r.meta.maxX - textX)
+        }
+
+        let titleClip = truncateText(mediaState.title, maxWidth: textW, size: 10.5, weight: .semibold)
+        drawText(titleClip, at: NSPoint(x: textX, y: 15.5), size: 10.5, weight: .semibold, color: .white)
 
         let subRaw: String
         if !mediaState.artist.isEmpty && mediaState.source != .universal {
@@ -1287,8 +1310,8 @@ final class CockpitView: NSView {
         } else {
             subRaw = mediaState.source.rawValue
         }
-        let subClip = truncateText(subRaw, maxWidth: r.meta.width, size: 8.5, weight: .medium)
-        drawText(subClip, at: NSPoint(x: r.meta.minX, y: 3.5), size: 8.5, weight: .medium, color: NSColor(calibratedWhite: 0.55, alpha: 1.0))
+        let subClip = truncateText(subRaw, maxWidth: textW, size: 8.5, weight: .medium)
+        drawText(subClip, at: NSPoint(x: textX, y: 3.5), size: 8.5, weight: .medium, color: NSColor(calibratedWhite: 0.55, alpha: 1.0))
 
         // Interactive Media Scrubber
         if mediaState.canSeek && mediaState.duration > 0 {
@@ -1530,13 +1553,13 @@ final class CockpitView: NSView {
 
     private func formatSpeedCompact(_ bps: Double) -> String {
         if bps >= 1024 * 1024 * 100 {
-            return String(format: "%.0fM", bps / (1024 * 1024))
+            return String(format: "%.0fMB", bps / (1024 * 1024))
         } else if bps >= 1024 * 1024 {
-            return String(format: "%.1fM", bps / (1024 * 1024))
+            return String(format: "%.1fMB", bps / (1024 * 1024))
         } else if bps >= 1024 * 10 {
-            return String(format: "%.0fK", bps / 1024)
+            return String(format: "%.0fKB", bps / 1024)
         } else if bps >= 1024 {
-            return String(format: "%.1fK", bps / 1024)
+            return String(format: "%.1fKB", bps / 1024)
         } else {
             return String(format: "%.0fB", bps)
         }

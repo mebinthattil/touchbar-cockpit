@@ -18,6 +18,7 @@ struct NowPlayingState {
     var elapsed: Double = 0
     var isPlaying: Bool = false
     var canSeek: Bool = false
+    var artwork: NSImage? = nil
     var fetchedAt: Date = Date()
 
     func interpolatedElapsed(at now: Date = Date()) -> Double {
@@ -36,6 +37,8 @@ final class MediaController {
     private let queue = DispatchQueue(label: "com.mebin.touchbarcockpit.media", qos: .userInitiated)
     private(set) var lastState = NowPlayingState()
     private var promptedBundles: Set<String> = []
+    private var cachedArtworkKey: String = ""
+    private var cachedArtworkImage: NSImage? = nil
 
     // MARK: - Fetch Live Metadata (Apple Music / Spotify / VLC via NSAppleScript + Zen/Chrome/IINA via AXUIElement)
     func fetchNowPlaying(completion: @escaping (NowPlayingState) -> Void) {
@@ -344,7 +347,11 @@ final class MediaController {
                 set tArtist to artist of current track
                 set tDur to (duration of current track) / 1000.0
                 set tPos to player position
-                return pState & "|||" & tName & "|||" & tArtist & "|||" & (tDur as string) & "|||" & (tPos as string)
+                set tArt to ""
+                try
+                    set tArt to artwork url of current track
+                end try
+                return pState & "|||" & tName & "|||" & tArtist & "|||" & (tDur as string) & "|||" & (tPos as string) & "|||" & tArt
             on error
                 return "NONE"
             end try
@@ -355,14 +362,19 @@ final class MediaController {
         guard parts.count >= 5 else { return nil }
         let dur = Double(parts[3].replacingOccurrences(of: ",", with: ".")) ?? 0
         let pos = Double(parts[4].replacingOccurrences(of: ",", with: ".")) ?? 0
+        let title = parts[1].isEmpty ? "Spotify" : parts[1]
+        let artist = parts[2]
+        let artURL = parts.count >= 6 ? parts[5] : ""
+        let art = resolveArtwork(cacheKey: "spotify|\(title)|\(artist)", spotifyURL: artURL, isMusic: false)
         return NowPlayingState(
             source: .spotify,
-            title: parts[1].isEmpty ? "Spotify" : parts[1],
-            artist: parts[2],
+            title: title,
+            artist: artist,
             duration: dur,
             elapsed: pos,
             isPlaying: parts[0].lowercased() == "playing",
             canSeek: dur > 0,
+            artwork: art,
             fetchedAt: Date()
         )
     }
@@ -388,16 +400,75 @@ final class MediaController {
         guard parts.count >= 5 else { return nil }
         let dur = Double(parts[3].replacingOccurrences(of: ",", with: ".")) ?? 0
         let pos = Double(parts[4].replacingOccurrences(of: ",", with: ".")) ?? 0
+        let title = parts[1].isEmpty ? "Music" : parts[1]
+        let artist = parts[2]
+        let art = resolveArtwork(cacheKey: "music|\(title)|\(artist)", spotifyURL: nil, isMusic: true)
         return NowPlayingState(
             source: .music,
-            title: parts[1].isEmpty ? "Music" : parts[1],
-            artist: parts[2],
+            title: title,
+            artist: artist,
             duration: dur,
             elapsed: pos,
             isPlaying: parts[0].lowercased() == "playing",
             canSeek: dur > 0,
+            artwork: art,
             fetchedAt: Date()
         )
+    }
+
+    /// Fetches & downsamples album cover to a crisp 52x52px Retina thumbnail, cached once per track.
+    private func resolveArtwork(cacheKey: String, spotifyURL: String?, isMusic: Bool) -> NSImage? {
+        if cacheKey == cachedArtworkKey {
+            return cachedArtworkImage
+        }
+
+        var rawData: Data? = nil
+        if isMusic {
+            let artScript = """
+            tell application "Music"
+                try
+                    return raw data of artwork 1 of current track
+                end try
+            end tell
+            """
+            if let script = NSAppleScript(source: artScript) {
+                var err: NSDictionary?
+                let desc = script.executeAndReturnError(&err)
+                if err == nil && desc.data.count > 64 {
+                    rawData = desc.data
+                }
+            }
+        } else if let urlStr = spotifyURL, !urlStr.isEmpty, let url = URL(string: urlStr) {
+            rawData = try? Data(contentsOf: url)
+        }
+
+        let thumb = rawData.flatMap { Self.downsampleThumbnail(data: $0, pixelSize: 52) }
+        cachedArtworkKey = cacheKey
+        cachedArtworkImage = thumb
+        return thumb
+    }
+
+    private static func downsampleThumbnail(data: Data, pixelSize: Int) -> NSImage? {
+        guard let src = NSImage(data: data),
+              let cg = src.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return nil
+        }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: pixelSize,
+            height: pixelSize,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: pixelSize, height: pixelSize))
+        guard let scaled = ctx.makeImage() else { return nil }
+        return NSImage(cgImage: scaled, size: NSSize(width: 26, height: 26))
     }
 
     private func queryVLC() -> NowPlayingState? {
