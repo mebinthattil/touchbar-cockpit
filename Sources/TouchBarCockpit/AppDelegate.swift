@@ -2,7 +2,7 @@ import AppKit
 import CoreGraphics
 import CPrivateAPIs
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let touchBarController = TouchBarController()
     private let cpuSampler = CPUSampler()
     private let memorySampler = MemorySampler()
@@ -13,7 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var metrics = SystemMetrics()
     private var telemetryTimer: Timer?
-    private var fnPollTimer: Timer?
+    private var fnFallbackPollTimer: Timer?
     private var globalFlagsMonitor: Any?
     private var localFlagsMonitor: Any?
     private var globalKeyMonitor: Any?
@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var fnComboUsed: Bool = false
     private var tickCount: Int = 0
     private var isPaused: Bool = false
+    private var isScreenAsleep: Bool = false
 
     // Status Bar Menu
     private var statusItem: NSStatusItem!
@@ -45,18 +46,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sampleMetrics(includeSlowSensors: true)
         touchBarController.present()
 
-        // 1 Hz telemetry loop (thermals/fan sampled every 2s to keep CPU < 0.5%)
-        telemetryTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
+        startTelemetryTimer()
+    }
+
+    private func startTelemetryTimer() {
+        telemetryTimer?.invalidate()
+        // 1 Hz coalesced telemetry loop (tolerance lets macOS align wakeups with system ticks)
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self, !self.isPaused, !self.isScreenAsleep else { return }
             self.tickCount += 1
             self.sampleMetrics(includeSlowSensors: self.tickCount % 2 == 0)
         }
-        RunLoop.main.add(telemetryTimer!, forMode: .common)
+        timer.tolerance = 0.2
+        RunLoop.main.add(timer, forMode: .common)
+        telemetryTimer = timer
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         telemetryTimer?.invalidate()
-        fnPollTimer?.invalidate()
+        fnFallbackPollTimer?.invalidate()
         audioSpectrumTap.stop()
         if let m = globalFlagsMonitor { NSEvent.removeMonitor(m) }
         if let m = localFlagsMonitor { NSEvent.removeMonitor(m) }
@@ -124,13 +132,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         metrics.timestamp = Date()
 
         touchBarController.update(metrics: metrics)
-        if !isPaused {
+        if !isPaused && !isScreenAsleep && (tickCount % 2 == 0 || audioSpectrumTap.isAudioActive) {
             audioSpectrumTap.checkOutputActivity()
         }
-        updateMenuSummary()
     }
 
-    // MARK: - Single-Tap Fn Toggle Monitor (Ignores Fn+Arrow / Fn+Delete combos)
+    // MARK: - Single-Tap Fn Toggle Monitor (100% Event-Driven: 0 Wakeups/sec when Accessibility is active!)
     private func setupFnKeyMonitor() {
         globalFlagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             let fnDown = event.modifierFlags.contains(.function)
@@ -149,15 +156,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Lightweight 35ms CGEventSource poll guarantees Fn tap works even while paused
-        fnPollTimer = Timer.scheduledTimer(withTimeInterval: 0.035, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            let flags = CGEventSource.flagsState(.combinedSessionState)
-            let fnDown = flags.contains(.maskSecondaryFn)
-            let otherMods = !flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty
-            self.processFnState(fnDown: fnDown, otherModsDown: otherMods)
+        // Only enable fallback polling if Accessibility isn't granted yet;
+        // once granted, NSEvent global flagsChanged is 100% event-driven (0 idle wakeups!).
+        updateFnFallbackPolling()
+    }
+
+    private func updateFnFallbackPolling() {
+        if TBIsAccessibilityTrusted(false) {
+            fnFallbackPollTimer?.invalidate()
+            fnFallbackPollTimer = nil
+        } else if fnFallbackPollTimer == nil {
+            let timer = Timer(timeInterval: 0.06, repeats: true) { [weak self] _ in
+                guard let self = self, !self.isScreenAsleep else { return }
+                let flags = CGEventSource.flagsState(.combinedSessionState)
+                let fnDown = flags.contains(.maskSecondaryFn)
+                let otherMods = !flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift]).isEmpty
+                self.processFnState(fnDown: fnDown, otherModsDown: otherMods)
+            }
+            timer.tolerance = 0.015
+            RunLoop.main.add(timer, forMode: .common)
+            fnFallbackPollTimer = timer
         }
-        RunLoop.main.add(fnPollTimer!, forMode: .common)
     }
 
     private func processFnState(fnDown: Bool, otherModsDown: Bool) {
@@ -202,6 +221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let reattachSelector = #selector(handleSystemWake)
 
         ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.screensDidSleepNotification, object: nil)
+        ws.addObserver(self, selector: #selector(handleSystemSleep), name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
         ws.addObserver(self, selector: reattachSelector, name: NSWorkspace.didWakeNotification, object: nil)
         ws.addObserver(self, selector: reattachSelector, name: NSWorkspace.screensDidWakeNotification, object: nil)
         ws.addObserver(self, selector: reattachSelector, name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
@@ -209,10 +230,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleSystemSleep() {
+        isScreenAsleep = true
+        telemetryTimer?.invalidate()
+        telemetryTimer = nil
         audioSpectrumTap.stop()
     }
 
     @objc private func handleSystemWake() {
+        isScreenAsleep = false
+        if !isPaused && telemetryTimer == nil {
+            startTelemetryTimer()
+        }
         guard !isPaused else { return }
         // Re-present slightly after wake so TouchBarServer is ready
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
@@ -233,6 +261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
+        menu.delegate = self
 
         summaryMenuItem = NSMenuItem(title: "TouchBarCockpit", action: nil, keyEquivalent: "")
         summaryMenuItem.isEnabled = false
@@ -268,6 +297,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
+    }
+
+    // MARK: - NSMenuDelegate (Update menu items only when actually opened — zero idle churn)
+    func menuWillOpen(_ menu: NSMenu) {
+        updateMenuSummary()
+        updateFnFallbackPolling()
     }
 
     private func updateMenuSummary() {
@@ -317,11 +352,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePause() {
         isPaused.toggle()
         if isPaused {
+            telemetryTimer?.invalidate()
+            telemetryTimer = nil
             audioSpectrumTap.stop()
             touchBarController.dismiss()
             pauseMenuItem.title = "Resume Cockpit"
         } else {
             touchBarController.present()
+            sampleMetrics(includeSlowSensors: true)
+            startTelemetryTimer()
             audioSpectrumTap.checkOutputActivity()
             pauseMenuItem.title = "Pause (Restore Native Bar)"
         }
@@ -331,6 +370,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isPaused = false
         pauseMenuItem.title = "Pause (Restore Native Bar)"
         touchBarController.present()
+        if telemetryTimer == nil {
+            startTelemetryTimer()
+        }
+        audioSpectrumTap.checkOutputActivity()
     }
 
     @objc private func quitApp() {

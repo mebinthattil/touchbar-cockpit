@@ -6,6 +6,8 @@ final class NetworkSampler {
     private var prevInBytes: UInt64 = 0
     private var prevOutBytes: UInt64 = 0
     private var prevTime: CFAbsoluteTime = 0
+    private var lastProxyPoll: CFAbsoluteTime = 0
+    private var cachedProxyActive: Bool = false
 
     struct Sample {
         let downBps: Double
@@ -80,14 +82,17 @@ final class NetworkSampler {
         prevOutBytes = outBytes
         prevTime = now
 
-        let proxy = Self.isSystemProxyEnabled()
+        if (now - lastProxyPoll) >= 3.0 || lastProxyPoll == 0 {
+            cachedProxyActive = Self.isSystemProxyEnabled()
+            lastProxyPoll = now
+        }
 
         return Sample(
             downBps: downBps,
             upBps: upBps,
             tailscaleActive: tailscale,
             vpnActive: vpn,
-            proxyActive: proxy
+            proxyActive: cachedProxyActive
         )
     }
 

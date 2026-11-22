@@ -58,6 +58,30 @@ final class CockpitView: NSView {
     private var waveformBands: [Float] = Array(repeating: 0, count: AudioSpectrumTap.bandCount)
     private var isAudioPlaying: Bool = false
 
+    // Cached Formatters & Symbol Images (eliminates repeated ICU / bitmap allocations per frame)
+    private static let timeFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss"
+        return df
+    }()
+
+    private static let dayFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "EEE d"
+        return df
+    }()
+
+    private static let waveformPalette: [NSColor] = [
+        NSColor(calibratedRed: 0.22, green: 0.74, blue: 0.97, alpha: 1.0),
+        NSColor(calibratedRed: 0.13, green: 0.83, blue: 0.93, alpha: 1.0),
+        NSColor(calibratedRed: 0.18, green: 0.84, blue: 0.75, alpha: 1.0),
+        NSColor(calibratedRed: 0.20, green: 0.85, blue: 0.58, alpha: 1.0),
+        NSColor(calibratedRed: 0.38, green: 0.65, blue: 0.98, alpha: 1.0),
+        NSColor(calibratedRed: 0.65, green: 0.54, blue: 0.98, alpha: 1.0)
+    ]
+
+    private var tintedSymbolCache: [String: NSImage] = [:]
+
     // Callbacks
     var onToggleKeepAwake: (() -> Void)?
     var onOpenFanControl: (() -> Void)?
@@ -1070,24 +1094,14 @@ final class CockpitView: NSView {
             return
         }
 
-        let df = DateFormatter()
-        df.dateFormat = "HH:mm"
-        let hm = df.string(from: metrics.timestamp)
-
-        let secDf = DateFormatter()
-        secDf.dateFormat = "ss"
-        let sec = secDf.string(from: metrics.timestamp)
-
         let centerX = rect.midX
-        let timeStr = "\(hm):\(sec)"
+        let timeStr = Self.timeFormatter.string(from: metrics.timestamp)
         drawTextCentered(timeStr, centerX: centerX, y: 13.5, size: 11.5, weight: .semibold, color: .white, mono: true)
 
         if metrics.keepAwakeActive {
             drawTextCentered("☕ AWAKE", centerX: centerX, y: 3.0, size: 7.5, weight: .bold, color: NSColor(calibratedRed: 0.99, green: 0.72, blue: 0.22, alpha: 1.0))
         } else {
-            let dayDf = DateFormatter()
-            dayDf.dateFormat = "EEE d"
-            let dayStr = dayDf.string(from: metrics.timestamp).uppercased()
+            let dayStr = Self.dayFormatter.string(from: metrics.timestamp).uppercased()
             drawTextCentered(dayStr, centerX: centerX, y: 3.0, size: 7.5, weight: .medium, color: NSColor(calibratedWhite: 0.48, alpha: 1.0))
         }
     }
@@ -1104,16 +1118,7 @@ final class CockpitView: NSView {
         let minH: CGFloat = 4.5
         let maxH: CGFloat = 22.0
 
-        // Dynamic Island-inspired vivid OLED spectrum gradient (cyan -> teal -> emerald -> sky -> violet)
-        let palette: [NSColor] = [
-            NSColor(calibratedRed: 0.22, green: 0.74, blue: 0.97, alpha: 1.0),
-            NSColor(calibratedRed: 0.13, green: 0.83, blue: 0.93, alpha: 1.0),
-            NSColor(calibratedRed: 0.18, green: 0.84, blue: 0.75, alpha: 1.0),
-            NSColor(calibratedRed: 0.20, green: 0.85, blue: 0.58, alpha: 1.0),
-            NSColor(calibratedRed: 0.38, green: 0.65, blue: 0.98, alpha: 1.0),
-            NSColor(calibratedRed: 0.65, green: 0.54, blue: 0.98, alpha: 1.0)
-        ]
-
+        let palette = Self.waveformPalette
         ctx.saveGState()
         for i in 0..<count {
             let level = CGFloat(min(1.0, max(0.0, waveformBands[i])))
@@ -1123,7 +1128,6 @@ final class CockpitView: NSView {
             let barRect = CGRect(x: x, y: y, width: barW, height: h)
             let path = CGPath(roundedRect: barRect, cornerWidth: barW / 2.0, cornerHeight: barW / 2.0, transform: nil)
             let baseColor = palette[i % palette.count]
-            // Subtle brightness modulation with amplitude so beats pop on OLED
             let alpha = 0.55 + 0.45 * level
             ctx.setFillColor(baseColor.withAlphaComponent(alpha).cgColor)
             ctx.addPath(path)
@@ -1143,11 +1147,8 @@ final class CockpitView: NSView {
         let padX: CGFloat = 24
         let cy = bounds.midY
 
-        // SF Symbol Icon
-        if let sym = NSImage(systemSymbolName: iconName, accessibilityDescription: nil) {
-            let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
-            let styled = sym.withSymbolConfiguration(cfg) ?? sym
-            let tinted = tintImage(styled, with: accent)
+        // SF Symbol Icon (cached to avoid per-frame lockFocus bitmap allocation during drags)
+        if let tinted = cachedTintedSymbol(iconName, pointSize: 15, color: accent) {
             let sz = tinted.size
             tinted.draw(in: NSRect(x: padX, y: cy - sz.height / 2, width: sz.width, height: sz.height))
         }
@@ -1386,10 +1387,7 @@ final class CockpitView: NSView {
         }
         ctx.restoreGState()
 
-        if let sym = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
-            let cfg = NSImage.SymbolConfiguration(pointSize: 12.5, weight: .semibold)
-            let styled = sym.withSymbolConfiguration(cfg) ?? sym
-            let tinted = tintImage(styled, with: accent ?? .white)
+        if let tinted = cachedTintedSymbol(symbol, pointSize: 12.5, color: accent ?? .white) {
             let sz = tinted.size
             tinted.draw(in: NSRect(
                 x: rect.midX - sz.width / 2.0,
@@ -1505,6 +1503,19 @@ final class CockpitView: NSView {
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
         let sz = (text as NSString).size(withAttributes: attrs)
         (text as NSString).draw(at: NSPoint(x: centerX - sz.width / 2.0, y: y), withAttributes: attrs)
+    }
+
+    private func cachedTintedSymbol(_ name: String, pointSize: CGFloat, color: NSColor) -> NSImage? {
+        let key = "\(name)|\(pointSize)|\(color.description)"
+        if let hit = tintedSymbolCache[key] {
+            return hit
+        }
+        guard let sym = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
+        let cfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .semibold)
+        let styled = sym.withSymbolConfiguration(cfg) ?? sym
+        let tinted = tintImage(styled, with: color)
+        tintedSymbolCache[key] = tinted
+        return tinted
     }
 
     private func tintImage(_ image: NSImage, with color: NSColor) -> NSImage {

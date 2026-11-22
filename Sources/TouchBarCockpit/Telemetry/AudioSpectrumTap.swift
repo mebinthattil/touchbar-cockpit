@@ -36,6 +36,7 @@ final class AudioSpectrumTap {
 
     // Smoothing & silence hysteresis
     private var smoothedBands: [Float] = Array(repeating: 0, count: bandCount)
+    private var lastEmittedBands: [Float] = Array(repeating: -1, count: bandCount)
     private var rollingPeak: Float = 0.08
     private var lastSoundTime: CFAbsoluteTime = 0
     private(set) var isAudioActive: Bool = false
@@ -230,12 +231,13 @@ final class AudioSpectrumTap {
         }
     }
 
-    // MARK: - 20 FPS FFT Analysis (Only runs while output stream is active)
+    // MARK: - 15 FPS FFT Analysis (Coalesced timer, only runs while output stream is active)
     private func startUITimer() {
         uiTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.066, repeats: true) { [weak self] _ in
             self?.analyzeFrame()
         }
+        timer.tolerance = 0.012
         RunLoop.main.add(timer, forMode: .common)
         uiTimer = timer
     }
@@ -329,16 +331,24 @@ final class AudioSpectrumTap {
             rollingPeak = max(0.035, rollingPeak * 0.985 + frameMax * 0.015)
         }
 
+        var changed = false
         for i in 0..<Self.bandCount {
             let norm = min(1.0, max(0.0, powf(rawBands[i] / max(0.025, rollingPeak * 1.15), 0.72)))
             let target = hasSignal ? norm : 0.0
             let prev = smoothedBands[i]
-            // Fast attack (0.58), smooth natural decay (0.28)
-            let alpha: Float = target > prev ? 0.58 : 0.28
-            smoothedBands[i] = prev + (target - prev) * alpha
+            // Fast attack (0.62), smooth natural decay (0.30) tuned for 15 FPS
+            let alpha: Float = target > prev ? 0.62 : 0.30
+            let next = prev + (target - prev) * alpha
+            smoothedBands[i] = next
+            if abs(next - lastEmittedBands[i]) > 0.008 {
+                changed = true
+            }
         }
 
-        onUpdate?(smoothedBands, true)
+        if changed {
+            lastEmittedBands = smoothedBands
+            onUpdate?(smoothedBands, true)
+        }
     }
 
     // MARK: - CoreAudio Output Activity Check (0.001% CPU!)
