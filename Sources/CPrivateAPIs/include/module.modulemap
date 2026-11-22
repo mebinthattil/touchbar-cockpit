@@ -1,0 +1,4 @@
+module CPrivateAPIs {
+    header "PrivateAPIs.h"
+    export *
+}
