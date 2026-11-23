@@ -19,7 +19,13 @@ final class CPUSampler {
         let total: Double
         let user: Double
         let system: Double
+        let loadAvg1m: Double
         let perCore: [Double]
+    }
+
+    private static func readLoadAvg1m() -> Double {
+        var avg: [Double] = [0]
+        return getloadavg(&avg, 1) > 0 ? avg[0] : 0
     }
 
     func sample() -> Sample {
@@ -35,8 +41,10 @@ final class CPUSampler {
             &numCPUInfo
         )
 
+        let load1m = Self.readLoadAvg1m()
+
         guard kr == KERN_SUCCESS, let info = cpuInfo else {
-            return Sample(total: 0, user: 0, system: 0, perCore: [])
+            return Sample(total: 0, user: 0, system: 0, loadAvg1m: load1m, perCore: [])
         }
 
         defer {
@@ -59,7 +67,7 @@ final class CPUSampler {
 
         guard prevTicks.count == count else {
             prevTicks = current
-            return Sample(total: 0, user: 0, system: 0, perCore: Array(repeating: 0, count: count))
+            return Sample(total: 0, user: 0, system: 0, loadAvg1m: load1m, perCore: Array(repeating: 0, count: count))
         }
 
         var totalUser: UInt64 = 0
@@ -90,13 +98,13 @@ final class CPUSampler {
         prevTicks = current
 
         guard totalAll > 0 else {
-            return Sample(total: 0, user: 0, system: 0, perCore: perCore)
+            return Sample(total: 0, user: 0, system: 0, loadAvg1m: load1m, perCore: perCore)
         }
 
         let userPct = Double(totalUser) / Double(totalAll) * 100.0
         let sysPct = Double(totalSys) / Double(totalAll) * 100.0
         let totPct = min(100.0, max(0.0, userPct + sysPct))
-        return Sample(total: totPct, user: userPct, system: sysPct, perCore: perCore)
+        return Sample(total: totPct, user: userPct, system: sysPct, loadAvg1m: load1m, perCore: perCore)
     }
 
     static func fetchTopProcesses(limit: Int = 3) -> [(name: String, pct: Double)] {

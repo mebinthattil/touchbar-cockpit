@@ -353,9 +353,16 @@ int32_t TBAtomicLoadInt32(const int32_t *ptr) {
     return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
 }
 
-static CFArrayRef TBSoCThermalServices(void) {
+typedef enum {
+    TBThermalClusterSoC = 0,
+    TBThermalClusterPCore = 1,
+    TBThermalClusterECore = 2
+} TBThermalCluster;
+
+static CFArrayRef TBSoCThermalServices(int **outClusters) {
     static IOHIDEventSystemClientRef client = NULL;
     static CFMutableArrayRef matchedServices = NULL;
+    static int *clusters = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
@@ -370,32 +377,41 @@ static CFArrayRef TBSoCThermalServices(void) {
 
         matchedServices = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
         CFIndex n = CFArrayGetCount(all);
+        clusters = (int *)calloc((size_t)(n > 0 ? n : 1), sizeof(int));
+        CFIndex matchedIdx = 0;
         for (CFIndex i = 0; i < n; i++) {
             IOHIDServiceClientRef svc = (IOHIDServiceClientRef)CFArrayGetValueAtIndex(all, i);
             CFStringRef name = (CFStringRef)IOHIDServiceClientCopyProperty(svc, CFSTR("Product"));
             if (!name) continue;
             NSString *nsName = (__bridge_transfer NSString *)name;
-            BOOL isSoC = ([nsName hasPrefix:@"PMU tdie"] ||
-                          [nsName hasPrefix:@"pACC MTR Temp"] ||
-                          [nsName hasPrefix:@"eACC MTR Temp"] ||
-                          [nsName hasPrefix:@"SOC MTR Temp"]);
-            if (isSoC) {
+            if ([nsName hasPrefix:@"pACC MTR Temp"]) {
                 CFArrayAppendValue(matchedServices, svc);
+                clusters[matchedIdx++] = TBThermalClusterPCore;
+            } else if ([nsName hasPrefix:@"eACC MTR Temp"]) {
+                CFArrayAppendValue(matchedServices, svc);
+                clusters[matchedIdx++] = TBThermalClusterECore;
+            } else if ([nsName hasPrefix:@"PMU tdie"] || [nsName hasPrefix:@"SOC MTR Temp"]) {
+                CFArrayAppendValue(matchedServices, svc);
+                clusters[matchedIdx++] = TBThermalClusterSoC;
             }
         }
         CFRelease(all);
     });
+    if (outClusters) *outClusters = clusters;
     return matchedServices;
 }
 
 TBThermalInfo TBReadThermalInfo(void) {
-    TBThermalInfo info = { -1.0, -1.0 };
-    CFArrayRef services = TBSoCThermalServices();
+    TBThermalInfo info = { -1.0, -1.0, -1.0, -1.0, -1.0 };
+    int *clusters = NULL;
+    CFArrayRef services = TBSoCThermalServices(&clusters);
     if (!services) return info;
 
     double sum = 0.0;
     int count = 0;
     double peak = 0.0;
+    double pSum = 0.0, eSum = 0.0, sSum = 0.0;
+    int pCnt = 0, eCnt = 0, sCnt = 0;
 
     CFIndex n = CFArrayGetCount(services);
     for (CFIndex i = 0; i < n; i++) {
@@ -408,6 +424,13 @@ TBThermalInfo TBReadThermalInfo(void) {
                 sum += temp;
                 count++;
                 if (temp > peak) peak = temp;
+                if (clusters) {
+                    switch (clusters[i]) {
+                        case TBThermalClusterPCore: pSum += temp; pCnt++; break;
+                        case TBThermalClusterECore: eSum += temp; eCnt++; break;
+                        default: sSum += temp; sCnt++; break;
+                    }
+                }
             }
         }
     }
@@ -416,6 +439,9 @@ TBThermalInfo TBReadThermalInfo(void) {
         info.avgTempC = sum / (double)count;
         info.peakTempC = peak;
     }
+    if (pCnt > 0) info.pCoreTempC = pSum / (double)pCnt;
+    if (eCnt > 0) info.eCoreTempC = eSum / (double)eCnt;
+    if (sCnt > 0) info.socClusterTempC = sSum / (double)sCnt;
     return info;
 }
 

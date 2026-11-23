@@ -40,6 +40,9 @@ void TBShowKeyboardBrightnessOSD(float brightness);
 typedef struct {
     double avgTempC;
     double peakTempC;
+    double pCoreTempC;
+    double eCoreTempC;
+    double socClusterTempC;
 } TBThermalInfo;
 
 /// Single-pass cached M2 SoC die temperature read (avg & peak in Celsius, negative if unavailable)

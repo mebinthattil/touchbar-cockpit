@@ -7,10 +7,15 @@ final class MemorySampler {
     struct Sample {
         let usedGB: Double
         let totalGB: Double
+        let appGB: Double
+        let wiredGB: Double
+        let compressedGB: Double
+        let cachedGB: Double
         let activeFrac: Double
         let wiredFrac: Double
         let compressedFrac: Double
         let swapUsedGB: Double
+        let swapTotalGB: Double
     }
 
     func sample() -> Sample {
@@ -28,11 +33,13 @@ final class MemorySampler {
         var activeBytes = 0.0
         var wiredBytes = 0.0
         var compressedBytes = 0.0
+        var cachedBytes = 0.0
         var usedBytes = 0.0
 
         if kr == KERN_SUCCESS {
             let internalPages = Double(vmStats.internal_page_count)
             let purgeablePages = Double(vmStats.purgeable_count)
+            let externalPages = Double(vmStats.external_page_count)
             let wiredPages = Double(vmStats.wire_count)
             let compressedPages = Double(vmStats.compressor_page_count)
 
@@ -41,23 +48,31 @@ final class MemorySampler {
             activeBytes = appPages * pageSize
             wiredBytes = wiredPages * pageSize
             compressedBytes = compressedPages * pageSize
+            cachedBytes = (externalPages + purgeablePages) * pageSize
             usedBytes = activeBytes + wiredBytes + compressedBytes
         }
 
         var swapUsage = xsw_usage()
         var swapSize = MemoryLayout<xsw_usage>.size
         var swapUsedGB = 0.0
+        var swapTotalGB = 0.0
         if sysctlbyname("vm.swapusage", &swapUsage, &swapSize, nil, 0) == 0 {
             swapUsedGB = Double(swapUsage.xsu_used) / 1_073_741_824.0
+            swapTotalGB = Double(swapUsage.xsu_total) / 1_073_741_824.0
         }
 
         return Sample(
             usedGB: usedBytes / 1_073_741_824.0,
             totalGB: totalGB,
+            appGB: activeBytes / 1_073_741_824.0,
+            wiredGB: wiredBytes / 1_073_741_824.0,
+            compressedGB: compressedBytes / 1_073_741_824.0,
+            cachedGB: cachedBytes / 1_073_741_824.0,
             activeFrac: min(1.0, activeBytes / totalBytes),
             wiredFrac: min(1.0, wiredBytes / totalBytes),
             compressedFrac: min(1.0, compressedBytes / totalBytes),
-            swapUsedGB: swapUsedGB
+            swapUsedGB: swapUsedGB,
+            swapTotalGB: swapTotalGB
         )
     }
 

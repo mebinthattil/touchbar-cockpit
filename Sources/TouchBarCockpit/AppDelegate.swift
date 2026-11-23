@@ -88,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         metrics.cpuTotal = cpu.total
         metrics.cpuUser = cpu.user
         metrics.cpuSystem = cpu.system
+        metrics.loadAvg1m = cpu.loadAvg1m
         metrics.coreLoads = cpu.perCore
         metrics.cpuHistory.append(cpu.total)
         if metrics.cpuHistory.count > 48 {
@@ -96,19 +97,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         metrics.memUsedGB = mem.usedGB
         metrics.memTotalGB = mem.totalGB
+        metrics.memAppGB = mem.appGB
+        metrics.memWiredGB = mem.wiredGB
+        metrics.memCompressedGB = mem.compressedGB
+        metrics.memCachedGB = mem.cachedGB
         metrics.memActiveFrac = mem.activeFrac
         metrics.memWiredFrac = mem.wiredFrac
         metrics.memCompressedFrac = mem.compressedFrac
         metrics.swapUsedGB = mem.swapUsedGB
+        metrics.swapTotalGB = mem.swapTotalGB
+        let memPct = mem.totalGB > 0 ? min(100.0, max(0.0, (mem.usedGB / mem.totalGB) * 100.0)) : 0
+        metrics.memHistory.append(memPct)
+        if metrics.memHistory.count > 48 {
+            metrics.memHistory.removeFirst(metrics.memHistory.count - 48)
+        }
 
         metrics.powerWatts = pwr.systemDrawWatts
         metrics.chargerInWatts = pwr.chargerInWatts
         metrics.batteryNetWatts = pwr.batteryNetWatts
         metrics.adapterMaxWatts = pwr.adapterMaxWatts
         metrics.batteryPercent = pwr.batteryPercent
+        metrics.batteryHealthPct = pwr.batteryHealthPct
+        metrics.batteryCycleCount = pwr.batteryCycleCount
+        metrics.batteryTempC = pwr.batteryTempC
+        metrics.batteryVoltageV = pwr.batteryVoltageV
         metrics.isPluggedIn = pwr.isPluggedIn
         metrics.isCharging = pwr.isCharging
         metrics.minutesRemaining = pwr.minutesRemaining
+        metrics.powerHistory.append(pwr.systemDrawWatts)
+        metrics.chargerInHistory.append(pwr.chargerInWatts)
+        if metrics.powerHistory.count > 48 {
+            metrics.powerHistory.removeFirst(metrics.powerHistory.count - 48)
+        }
+        if metrics.chargerInHistory.count > 48 {
+            metrics.chargerInHistory.removeFirst(metrics.chargerInHistory.count - 48)
+        }
 
         metrics.netDownBps = net.downBps
         metrics.netUpBps = net.upBps
@@ -120,6 +143,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if metrics.netUpHistory.count > 36 {
             metrics.netUpHistory.removeFirst(metrics.netUpHistory.count - 36)
         }
+        metrics.primaryInterface = net.primaryInterface
+        metrics.localIPv4 = net.localIPv4
+        metrics.sessionDownBytes = net.sessionDownBytes
+        metrics.sessionUpBytes = net.sessionUpBytes
         metrics.tailscaleActive = net.tailscaleActive
         metrics.vpnActive = net.vpnActive
         metrics.proxyActive = net.proxyActive
@@ -128,9 +155,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let th = thermalSampler.sample()
             metrics.socTempC = th.socTempC
             metrics.socPeakTempC = th.socPeakTempC
+            metrics.pCoreTempC = th.pCoreTempC
+            metrics.eCoreTempC = th.eCoreTempC
+            metrics.socClusterTempC = th.socClusterTempC
             metrics.fanAvailable = th.fanAvailable
             metrics.fanRPM = th.fanRPM
+            metrics.fanMinRPM = th.fanMinRPM
             metrics.fanMaxRPM = th.fanMaxRPM
+            metrics.thermalStateRaw = th.thermalStateRaw
+        }
+        if metrics.socTempC > 0 {
+            metrics.tempHistory.append(metrics.socTempC)
+            if metrics.tempHistory.count > 48 {
+                metrics.tempHistory.removeFirst(metrics.tempHistory.count - 48)
+            }
         }
 
         metrics.keepAwakeActive = KeepAwakeManager.shared.isActive

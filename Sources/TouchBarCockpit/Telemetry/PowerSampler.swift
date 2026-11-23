@@ -9,6 +9,10 @@ final class PowerSampler {
         let batteryNetWatts: Double
         let adapterMaxWatts: Int
         let batteryPercent: Int
+        let batteryHealthPct: Int
+        let batteryCycleCount: Int
+        let batteryTempC: Double
+        let batteryVoltageV: Double
         let isPluggedIn: Bool
         let isCharging: Bool
         let minutesRemaining: Int?
@@ -18,6 +22,10 @@ final class PowerSampler {
     // while reading live 1Hz SMC wattage (PSTR/PDTR/PPBR) every second with zero heap churn.
     private var lastBatteryPoll: CFAbsoluteTime = 0
     private var cachedBatteryPercent: Int = 100
+    private var cachedBatteryHealthPct: Int = 0
+    private var cachedBatteryCycles: Int = 0
+    private var cachedBatteryTempC: Double = -1
+    private var cachedBatteryVoltageV: Double = 0
     private var cachedExternal: Bool = true
     private var cachedCharging: Bool = false
     private var cachedMinutes: Int? = nil
@@ -73,6 +81,10 @@ final class PowerSampler {
             batteryNetWatts: batteryNetWatts,
             adapterMaxWatts: cachedAdapterWatts,
             batteryPercent: cachedBatteryPercent,
+            batteryHealthPct: cachedBatteryHealthPct,
+            batteryCycleCount: cachedBatteryCycles,
+            batteryTempC: cachedBatteryTempC,
+            batteryVoltageV: cachedBatteryVoltageV,
             isPluggedIn: cachedExternal,
             isCharging: cachedCharging,
             minutesRemaining: cachedMinutes
@@ -95,6 +107,18 @@ final class PowerSampler {
         cachedBatteryPercent = min(100, max(0, (currentCap * 100) / maxCap))
         cachedExternal = dict["ExternalConnected"] as? Bool ?? false
         cachedCharging = dict["IsCharging"] as? Bool ?? false
+
+        let rawMaxCap = dict["AppleRawMaxCapacity"] as? Int ?? 0
+        let designCap = dict["DesignCapacity"] as? Int ?? 0
+        if rawMaxCap > 0 && designCap > 0 {
+            cachedBatteryHealthPct = min(100, max(1, Int(round(Double(rawMaxCap) / Double(designCap) * 100.0))))
+        }
+        cachedBatteryCycles = dict["CycleCount"] as? Int ?? 0
+
+        // AppleSmartBattery Temperature is reported in centi-Celsius (e.g. 3020 = 30.2°C)
+        if let rawTemp = dict["Temperature"] as? Int, rawTemp > 1000 && rawTemp < 9000 {
+            cachedBatteryTempC = Double(rawTemp) / 100.0
+        }
 
         if let tte = dict["AvgTimeToEmpty"] as? Int, !cachedExternal, tte > 0, tte < 6000 {
             cachedMinutes = tte
@@ -122,6 +146,9 @@ final class PowerSampler {
             }
         }
         let voltageMV = dict["Voltage"] as? Int ?? 0
+        if voltageMV > 0 {
+            cachedBatteryVoltageV = Double(voltageMV) / 1000.0
+        }
         let ampRaw = dict["InstantAmperage"] as? Int64 ?? 0
         if abs(battW) < 0.05 && voltageMV > 0 && abs(ampRaw) > 0 && abs(ampRaw) < 20000 {
             battW = (Double(ampRaw) * Double(voltageMV)) / 1_000_000.0

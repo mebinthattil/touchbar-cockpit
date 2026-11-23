@@ -5,6 +5,8 @@ import SystemConfiguration
 final class NetworkSampler {
     private var prevInBytes: UInt64 = 0
     private var prevOutBytes: UInt64 = 0
+    private var sessionInBytes: UInt64 = 0
+    private var sessionOutBytes: UInt64 = 0
     private var prevTime: CFAbsoluteTime = 0
     private var lastProxyPoll: CFAbsoluteTime = 0
     private var cachedProxyActive: Bool = false
@@ -12,6 +14,10 @@ final class NetworkSampler {
     struct Sample {
         let downBps: Double
         let upBps: Double
+        let primaryInterface: String
+        let localIPv4: String
+        let sessionDownBytes: UInt64
+        let sessionUpBytes: UInt64
         let tailscaleActive: Bool
         let vpnActive: Bool
         let proxyActive: Bool
@@ -22,6 +28,8 @@ final class NetworkSampler {
         var outBytes: UInt64 = 0
         var tailscale = false
         var vpn = false
+        var primaryIf = ""
+        var localIP = ""
 
         var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&ifaddrPtr) == 0, let first = ifaddrPtr {
@@ -42,6 +50,20 @@ final class NetworkSampler {
                         let ifData = data.assumingMemoryBound(to: if_data.self).pointee
                         inBytes &+= UInt64(ifData.ifi_ibytes)
                         outBytes &+= UInt64(ifData.ifi_obytes)
+                    }
+
+                    // Capture primary active physical IPv4 interface (prefer en0 Wi-Fi / first active en*)
+                    if family == AF_INET, name.hasPrefix("en"), isUp {
+                        let sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                        var addrCopy = sin.sin_addr
+                        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                        if inet_ntop(AF_INET, &addrCopy, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                            let ipStr = String(cString: buf)
+                            if !ipStr.hasPrefix("169.254.") && (primaryIf.isEmpty || name == "en0") {
+                                primaryIf = name
+                                localIP = ipStr
+                            }
+                        }
                     }
 
                     // Detect Tailscale (100.64.0.0/10 CGNAT on utun*) or other active VPN (IPv4 on utun*)
@@ -70,10 +92,14 @@ final class NetworkSampler {
             let dt = now - prevTime
             if dt > 0.1 {
                 if inBytes >= prevInBytes {
-                    downBps = Double(inBytes - prevInBytes) / dt
+                    let deltaIn = inBytes - prevInBytes
+                    downBps = Double(deltaIn) / dt
+                    sessionInBytes &+= deltaIn
                 }
                 if outBytes >= prevOutBytes {
-                    upBps = Double(outBytes - prevOutBytes) / dt
+                    let deltaOut = outBytes - prevOutBytes
+                    upBps = Double(deltaOut) / dt
+                    sessionOutBytes &+= deltaOut
                 }
             }
         }
@@ -90,6 +116,10 @@ final class NetworkSampler {
         return Sample(
             downBps: downBps,
             upBps: upBps,
+            primaryInterface: primaryIf,
+            localIPv4: localIP,
+            sessionDownBytes: sessionInBytes,
+            sessionUpBytes: sessionOutBytes,
             tailscaleActive: tailscale,
             vpnActive: vpn,
             proxyActive: cachedProxyActive

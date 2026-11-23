@@ -5,11 +5,20 @@ final class CockpitView: NSView {
     // MARK: - State
     private var metrics = SystemMetrics()
 
+    private enum InspectorKind {
+        case cpu
+        case ram
+        case thermal
+        case power
+        case network
+    }
+
     private enum ActiveHUD {
         case none
         case volume(value: Float, muted: Bool)
         case brightness(value: Float)
         case infoToast(title: String, detail: String, accent: NSColor)
+        case inspector(InspectorKind)
         case media
         case agentFlash(agent: String, startTime: CFAbsoluteTime)
     }
@@ -17,6 +26,12 @@ final class CockpitView: NSView {
     private var activeHUD: ActiveHUD = .none
     private var hudDismissTimer: Timer?
     private var flashAnimTimer: Timer?
+
+    // MARK: - Expanded Inspector State
+    private var topCPUProcesses: [(name: String, pct: Double)] = []
+    private var topRAMProcesses: [(name: String, mb: Double)] = []
+    private var isFetchingTopProcesses: Bool = false
+    private var inspectorTickCount: Int = 0
 
     // MARK: - Media Overlay State
     private var mediaState = NowPlayingState()
@@ -129,9 +144,22 @@ final class CockpitView: NSView {
     // MARK: - Public Updates
     func update(metrics: SystemMetrics) {
         self.metrics = metrics
-        // Skip redrawing the cockpit when a full-width overlay (Media / Slider / Amber Flash) covers it
-        if case .none = activeHUD {
+        // Redraw live 1 Hz cockpit OR open Expanded Inspector; skip when Media/Slider/Flash covers it
+        switch activeHUD {
+        case .none:
             needsDisplay = true
+        case .inspector(let kind):
+            inspectorTickCount += 1
+            if inspectorTickCount % 2 == 0 {
+                if kind == .cpu {
+                    refreshTopProcesses(isCPU: true)
+                } else if kind == .ram {
+                    refreshTopProcesses(isCPU: false)
+                }
+            }
+            needsDisplay = true
+        default:
+            break
         }
     }
 
@@ -221,6 +249,10 @@ final class CockpitView: NSView {
             if case .media = activeHUD { return true }
             return false
         }())
+        let previousInspector: InspectorKind? = {
+            if case .inspector(let kind) = activeHUD { return kind }
+            return nil
+        }()
 
         hudDismissTimer?.invalidate()
         mediaTickTimer?.invalidate()
@@ -246,6 +278,8 @@ final class CockpitView: NSView {
                     self.isMediaOverlayPinned = true
                     self.configureMediaTickTimer()
                     self.needsDisplay = true
+                } else if let kind = previousInspector {
+                    self.openInspector(kind)
                 } else {
                     self.dismissActiveHUD()
                 }
@@ -1041,10 +1075,63 @@ final class CockpitView: NSView {
         }
     }
 
+    // MARK: - Expanded Live Panel Inspector (stays open until manually tapped/closed)
+    private func openInspector(_ kind: InspectorKind) {
+        cancelLongPress()
+        hudDismissTimer?.invalidate()
+        hudDismissTimer = nil
+        mediaTickTimer?.invalidate()
+        mediaTickTimer = nil
+        flashAnimTimer?.invalidate()
+        flashAnimTimer = nil
+        cancelSliderSyncAndEase()
+        inspectorTickCount = 0
+        activeHUD = .inspector(kind)
+        needsDisplay = true
+
+        if kind == .cpu {
+            refreshTopProcesses(isCPU: true)
+        } else if kind == .ram {
+            refreshTopProcesses(isCPU: false)
+        }
+    }
+
+    private func refreshTopProcesses(isCPU: Bool) {
+        guard !isFetchingTopProcesses else { return }
+        isFetchingTopProcesses = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            if isCPU {
+                let top = CPUSampler.fetchTopProcesses(limit: 3)
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.isFetchingTopProcesses = false
+                    self.topCPUProcesses = top
+                    if case .inspector(.cpu) = self.activeHUD {
+                        self.needsDisplay = true
+                    }
+                }
+            } else {
+                let top = MemorySampler.fetchTopRAMProcesses(limit: 3)
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.isFetchingTopProcesses = false
+                    self.topRAMProcesses = top
+                    if case .inspector(.ram) = self.activeHUD {
+                        self.needsDisplay = true
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Single Tap Panel Interactions
     private func handleSingleTap(at point: NSPoint) {
-        // Dismiss any active toast or agent flash if tapped
+        // Dismiss any active toast, inspector, or agent flash if tapped
         if case .infoToast = activeHUD {
+            dismissActiveHUD()
+            return
+        }
+        if case .inspector = activeHUD {
             dismissActiveHUD()
             return
         }
@@ -1055,66 +1142,20 @@ final class CockpitView: NSView {
 
         let rects = panelRects(for: bounds)
         if rects.cpu.contains(point) {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let top = CPUSampler.fetchTopProcesses(limit: 3)
-                let summary = top.isEmpty
-                    ? "No active processes"
-                    : top.map { String(format: "%@ %.0f%%", $0.name, $0.pct) }.joined(separator: "   ·   ")
-                DispatchQueue.main.async {
-                    self?.showTransientToast(title: "TOP CPU", detail: summary, accent: NSColor(calibratedRed: 0.98, green: 0.57, blue: 0.24, alpha: 1.0), duration: 3.5)
-                }
-            }
+            openInspector(.cpu)
         } else if rects.ram.contains(point) {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let top = MemorySampler.fetchTopRAMProcesses(limit: 3)
-                let summary = top.isEmpty
-                    ? "No memory info"
-                    : top.map { proc -> String in
-                        if proc.mb >= 1024 {
-                            return String(format: "%@ %.1fG", proc.name, proc.mb / 1024.0)
-                        } else {
-                            return String(format: "%@ %.0fM", proc.name, proc.mb)
-                        }
-                    }.joined(separator: "   ·   ")
-                DispatchQueue.main.async {
-                    self?.showTransientToast(title: "TOP RAM", detail: summary, accent: NSColor(calibratedRed: 0.20, green: 0.83, blue: 0.60, alpha: 1.0), duration: 3.5)
-                }
-            }
+            openInspector(.ram)
         } else if rects.thermal.contains(point) {
             if waitingAgentName != nil {
                 clearWaitingAgent()
                 onFocusTerminal?()
                 return
             }
-            let peakStr = metrics.socPeakTempC > 0 ? String(format: "Peak %.0f°C", metrics.socPeakTempC) : "Thermal OK"
-            let fanPct = metrics.fanMaxRPM > 0 ? Int((metrics.fanRPM / metrics.fanMaxRPM) * 100.0) : 0
-            let fanStr = metrics.fanAvailable ? String(format: "Fan %.0f RPM (%d%%)", metrics.fanRPM, fanPct) : "Fan Passive"
-            showTransientToast(title: "M2 THERMALS", detail: "\(peakStr)   ·   \(fanStr)", accent: NSColor(calibratedRed: 0.38, green: 0.75, blue: 0.98, alpha: 1.0), duration: 2.6)
+            openInspector(.thermal)
         } else if rects.power.contains(point) {
-            let detail: String
-            if metrics.isPluggedIn {
-                let adapterStr = metrics.adapterMaxWatts > 0 ? " (\(metrics.adapterMaxWatts)W PD)" : ""
-                let battFlow = abs(metrics.batteryNetWatts) >= 0.2
-                    ? String(format: "   ·   Batt %+.1fW", metrics.batteryNetWatts)
-                    : ""
-                detail = String(format: "Draw %.1fW   ·   In %.1fW%@%@   ·   %d%%", metrics.powerWatts, metrics.chargerInWatts, adapterStr, battFlow, metrics.batteryPercent)
-            } else {
-                let remStr: String
-                if let mins = metrics.minutesRemaining {
-                    remStr = String(format: "   ·   %dh %02dm left", mins / 60, mins % 60)
-                } else {
-                    remStr = ""
-                }
-                detail = String(format: "Draw %.1fW   ·   On Battery %d%%%@", metrics.powerWatts, metrics.batteryPercent, remStr)
-            }
-            showTransientToast(title: "POWER", detail: detail, accent: NSColor(calibratedRed: 0.98, green: 0.80, blue: 0.20, alpha: 1.0), duration: 3.2)
+            openInspector(.power)
         } else if rects.network.contains(point) {
-            var flags: [String] = []
-            if metrics.tailscaleActive { flags.append("Tailscale ON") }
-            if metrics.vpnActive { flags.append("VPN ON") }
-            if metrics.proxyActive { flags.append("Proxy ON") }
-            let netFlags = flags.isEmpty ? "Direct (No VPN/Proxy)" : flags.joined(separator: " · ")
-            showTransientToast(title: "NETWORK", detail: "↓ \(formatSpeed(metrics.netDownBps))   ↑ \(formatSpeed(metrics.netUpBps))   ·   \(netFlags)", accent: NSColor(calibratedRed: 0.65, green: 0.55, blue: 0.98, alpha: 1.0), duration: 3.0)
+            openInspector(.network)
         } else if rects.clock.contains(point) {
             openMediaOverlay(togglePlayback: false, pinned: true)
         }
@@ -1182,6 +1223,10 @@ final class CockpitView: NSView {
 
         case .infoToast(let title, let detail, let accent):
             drawToastHUD(ctx: ctx, title: title, detail: detail, accent: accent)
+            return
+
+        case .inspector(let kind):
+            drawInspectorHUD(ctx: ctx, kind: kind)
             return
 
         case .media:
@@ -1593,7 +1638,7 @@ final class CockpitView: NSView {
         ctx.restoreGState()
     }
 
-    // MARK: - Inline Transient Toast HUD (Tap to Inspect)
+    // MARK: - Inline Transient Toast HUD
     private func drawToastHUD(ctx: CGContext, title: String, detail: String, accent: NSColor) {
         let padX: CGFloat = 16
         let badgeRect = CGRect(x: padX, y: 6, width: 88, height: 18)
@@ -1610,6 +1655,669 @@ final class CockpitView: NSView {
 
         drawTextCentered(title, centerX: badgeRect.midX, y: 9.5, size: 9.5, weight: .bold, color: accent)
         drawText(detail, at: NSPoint(x: badgeRect.maxX + 14, y: 8.5), size: 11.5, weight: .medium, color: .white, mono: true)
+    }
+
+    // MARK: - Full-Width Expanded Live Telemetry Inspectors (1004x30pt)
+    private func drawInspectorHUD(ctx: CGContext, kind: InspectorKind) {
+        let h = bounds.height
+        let badgeW: CGFloat = 56
+        let badgeRect = CGRect(x: 6, y: 4, width: badgeW, height: h - 8)
+        let closeW: CGFloat = 28
+        let closeRect = NSRect(x: bounds.width - 6 - closeW, y: 3, width: closeW, height: h - 6)
+        let contentRect = NSRect(x: badgeRect.maxX + 8, y: 0, width: max(200, closeRect.minX - badgeRect.maxX - 16), height: h)
+
+        let title: String
+        let accent: NSColor
+        switch kind {
+        case .cpu:
+            title = "CPU"
+            accent = metrics.cpuTotal >= 85
+                ? NSColor(calibratedRed: 1.0, green: 0.34, blue: 0.34, alpha: 1.0)
+                : (metrics.cpuTotal >= 55
+                    ? NSColor(calibratedRed: 0.99, green: 0.65, blue: 0.22, alpha: 1.0)
+                    : NSColor(calibratedRed: 0.24, green: 0.82, blue: 0.98, alpha: 1.0))
+        case .ram:
+            title = "RAM"
+            accent = NSColor(calibratedRed: 0.20, green: 0.83, blue: 0.60, alpha: 1.0)
+        case .thermal:
+            title = "THERM"
+            accent = tempColor(for: metrics.socTempC)
+        case .power:
+            title = "POWER"
+            accent = NSColor(calibratedRed: 0.98, green: 0.80, blue: 0.24, alpha: 1.0)
+        case .network:
+            title = "NET"
+            accent = NSColor(calibratedRed: 0.65, green: 0.55, blue: 0.98, alpha: 1.0)
+        }
+
+        // Left Accent Pill Badge
+        let badgePath = CGPath(roundedRect: badgeRect, cornerWidth: 5.5, cornerHeight: 5.5, transform: nil)
+        ctx.saveGState()
+        ctx.setFillColor(accent.withAlphaComponent(0.20).cgColor)
+        ctx.addPath(badgePath)
+        ctx.fillPath()
+        ctx.setStrokeColor(accent.withAlphaComponent(0.80).cgColor)
+        ctx.setLineWidth(0.9)
+        ctx.addPath(badgePath)
+        ctx.strokePath()
+        ctx.restoreGState()
+        drawTextCentered(title, centerX: badgeRect.midX, y: 9.0, size: 9.5, weight: .bold, color: accent)
+
+        // Right Compact Close Button
+        drawMediaButton(ctx: ctx, rect: closeRect, symbol: "xmark", pressed: false, accent: nil)
+
+        switch kind {
+        case .cpu:
+            drawCPUInspector(ctx: ctx, rect: contentRect, accent: accent)
+        case .ram:
+            drawRAMInspector(ctx: ctx, rect: contentRect, accent: accent)
+        case .thermal:
+            drawThermalInspector(ctx: ctx, rect: contentRect, accent: accent)
+        case .power:
+            drawPowerInspector(ctx: ctx, rect: contentRect, accent: accent)
+        case .network:
+            drawNetworkInspector(ctx: ctx, rect: contentRect, accent: accent)
+        }
+    }
+
+    private func tempColor(for temp: Double) -> NSColor {
+        if temp < 0 { return NSColor(calibratedWhite: 0.55, alpha: 1.0) }
+        if temp >= 80 { return NSColor(calibratedRed: 1.0, green: 0.32, blue: 0.32, alpha: 1.0) }
+        if temp >= 62 { return NSColor(calibratedRed: 0.99, green: 0.66, blue: 0.22, alpha: 1.0) }
+        if temp >= 48 { return NSColor(calibratedRed: 0.26, green: 0.85, blue: 0.62, alpha: 1.0) }
+        return NSColor(calibratedRed: 0.36, green: 0.78, blue: 0.99, alpha: 1.0)
+    }
+
+    private func drawExpandedGraph(
+        ctx: CGContext,
+        values: [Double],
+        secondaryValues: [Double]? = nil,
+        minValue: Double = 0,
+        maxValue: Double,
+        rect: CGRect,
+        strokeColor: NSColor,
+        secondaryColor: NSColor? = nil,
+        fillAlpha: CGFloat = 0.26,
+        guideFrac: CGFloat? = 0.5,
+        leftTag: String? = nil,
+        rightTag: String? = nil,
+        rightTagColor: NSColor? = nil
+    ) {
+        let bgPath = CGPath(roundedRect: rect, cornerWidth: 4.5, cornerHeight: 4.5, transform: nil)
+        ctx.saveGState()
+        ctx.setFillColor(NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor)
+        ctx.addPath(bgPath)
+        ctx.fillPath()
+        ctx.addPath(bgPath)
+        ctx.clip()
+
+        if let gf = guideFrac {
+            let gy = rect.minY + rect.height * gf
+            ctx.setStrokeColor(NSColor(calibratedWhite: 0.22, alpha: 1.0).cgColor)
+            ctx.setLineWidth(0.5)
+            ctx.setLineDash(phase: 0, lengths: [2, 2])
+            ctx.move(to: CGPoint(x: rect.minX, y: gy))
+            ctx.addLine(to: CGPoint(x: rect.maxX, y: gy))
+            ctx.strokePath()
+            ctx.setLineDash(phase: 0, lengths: [])
+        }
+
+        let span = max(0.0001, maxValue - minValue)
+        let inner = rect.insetBy(dx: 1, dy: 1)
+
+        if values.count >= 2 {
+            let stepX = inner.width / CGFloat(values.count - 1)
+            let linePath = CGMutablePath()
+            let fillPath = CGMutablePath()
+            for (i, v) in values.enumerated() {
+                let x = inner.minX + CGFloat(i) * stepX
+                let norm = CGFloat(min(1.0, max(0.0, (v - minValue) / span)))
+                let y = inner.minY + norm * (inner.height - 1.5) + 0.5
+                if i == 0 {
+                    linePath.move(to: CGPoint(x: x, y: y))
+                    fillPath.move(to: CGPoint(x: x, y: inner.minY))
+                    fillPath.addLine(to: CGPoint(x: x, y: y))
+                } else {
+                    linePath.addLine(to: CGPoint(x: x, y: y))
+                    fillPath.addLine(to: CGPoint(x: x, y: y))
+                }
+            }
+            fillPath.addLine(to: CGPoint(x: inner.maxX, y: inner.minY))
+            fillPath.closeSubpath()
+
+            ctx.setFillColor(strokeColor.withAlphaComponent(fillAlpha).cgColor)
+            ctx.addPath(fillPath)
+            ctx.fillPath()
+
+            ctx.setStrokeColor(strokeColor.cgColor)
+            ctx.setLineWidth(1.4)
+            ctx.setLineJoin(.round)
+            ctx.addPath(linePath)
+            ctx.strokePath()
+        }
+
+        if let sec = secondaryValues, let secColor = secondaryColor, sec.count >= 2 {
+            let stepX = inner.width / CGFloat(sec.count - 1)
+            let linePath = CGMutablePath()
+            for (i, v) in sec.enumerated() {
+                let x = inner.minX + CGFloat(i) * stepX
+                let norm = CGFloat(min(1.0, max(0.0, (v - minValue) / span)))
+                let y = inner.minY + norm * (inner.height - 1.5) + 0.5
+                if i == 0 { linePath.move(to: CGPoint(x: x, y: y)) }
+                else { linePath.addLine(to: CGPoint(x: x, y: y)) }
+            }
+            ctx.setStrokeColor(secColor.withAlphaComponent(0.92).cgColor)
+            ctx.setLineWidth(1.25)
+            ctx.setLineJoin(.round)
+            ctx.addPath(linePath)
+            ctx.strokePath()
+        }
+
+        ctx.restoreGState()
+
+        if let lt = leftTag {
+            let font = Self.cachedFont(size: 7.5, weight: .semibold, mono: true)
+            let tw = (lt as NSString).size(withAttributes: [.font: font]).width
+            let pill = CGRect(x: rect.minX + 2.5, y: rect.maxY - 10.5, width: tw + 5, height: 9.0)
+            ctx.saveGState()
+            ctx.setFillColor(NSColor.black.withAlphaComponent(0.62).cgColor)
+            ctx.addPath(CGPath(roundedRect: pill, cornerWidth: 2.5, cornerHeight: 2.5, transform: nil))
+            ctx.fillPath()
+            ctx.restoreGState()
+            drawText(lt, at: NSPoint(x: rect.minX + 5.0, y: rect.maxY - 10.5), size: 7.5, weight: .semibold, color: NSColor(calibratedWhite: 0.62, alpha: 1.0), mono: true)
+        }
+        if let rt = rightTag {
+            let font = Self.cachedFont(size: 7.5, weight: .bold, mono: true)
+            let tw = (rt as NSString).size(withAttributes: [.font: font]).width
+            let pill = CGRect(x: rect.maxX - tw - 7.5, y: rect.maxY - 10.5, width: tw + 5, height: 9.0)
+            ctx.saveGState()
+            ctx.setFillColor(NSColor.black.withAlphaComponent(0.62).cgColor)
+            ctx.addPath(CGPath(roundedRect: pill, cornerWidth: 2.5, cornerHeight: 2.5, transform: nil))
+            ctx.fillPath()
+            ctx.restoreGState()
+            drawTextRight(rt, rightX: rect.maxX - 5.0, y: rect.maxY - 10.5, size: 7.5, weight: .bold, color: rightTagColor ?? strokeColor, mono: true)
+        }
+    }
+
+    private func drawTopProcessColumn(ctx: CGContext, rect: NSRect, rows: [(name: String, value: String)], accent: NSColor, emptyText: String) {
+        if rows.isEmpty {
+            drawTextCentered(isFetchingTopProcesses ? "Scanning…" : emptyText, centerX: rect.midX, y: 10.5, size: 8.5, weight: .medium, color: NSColor(calibratedWhite: 0.48, alpha: 1.0))
+            return
+        }
+        let ys: [CGFloat] = [20.0, 10.5, 1.0]
+        let nameMaxW = max(50, rect.width - 52)
+        for (i, row) in rows.prefix(3).enumerated() {
+            let y = ys[i]
+            let rankColor = NSColor(calibratedWhite: i == 0 ? 0.62 : 0.42, alpha: 1.0)
+            let nameColor = NSColor(calibratedWhite: i == 0 ? 0.94 : 0.72, alpha: 1.0)
+            let valColor = (i == 0) ? accent : accent.withAlphaComponent(0.75)
+
+            drawText("\(i + 1)", at: NSPoint(x: rect.minX, y: y), size: 7.8, weight: .bold, color: rankColor, mono: true)
+            let cleanName = (row.name as NSString).lastPathComponent
+            let trimmed = truncateText(cleanName, maxWidth: nameMaxW, size: 8.0, weight: i == 0 ? .semibold : .medium)
+            drawText(trimmed, at: NSPoint(x: rect.minX + 10, y: y), size: 8.0, weight: i == 0 ? .semibold : .medium, color: nameColor)
+            drawTextRight(row.value, rightX: rect.maxX, y: y, size: 8.0, weight: .bold, color: valColor, mono: true)
+        }
+    }
+
+    // MARK: - 1. CPU Expanded Inspector (Total/Usr/Sys + 48s Graph + Per-Core E/P Grid + Top 3)
+    private func drawCPUInspector(ctx: CGContext, rect: NSRect, accent: NSColor) {
+        let w = rect.width
+        let x0 = rect.minX
+        let cyan = NSColor(calibratedRed: 0.24, green: 0.82, blue: 0.98, alpha: 1.0)
+        let orange = NSColor(calibratedRed: 0.99, green: 0.62, blue: 0.22, alpha: 1.0)
+
+        let z1W = floor(w * 0.180) // Overall + User/Sys + Load
+        let z2W = floor(w * 0.245) // Expanded 48s Sparkline
+        let z3W = floor(w * 0.325) // Per-core live breakdown
+        let z4W = w - z1W - z2W - z3W // Top 3 CPU processes
+
+        // Zone 1: Overall Load + User/Sys Split + 1m Load Avg
+        let z1 = NSRect(x: x0, y: 0, width: z1W - 6, height: rect.height)
+        drawText(String(format: "%.0f%%", metrics.cpuTotal), at: NSPoint(x: z1.minX, y: 15.5), size: 12, weight: .bold, color: accent, mono: true)
+        let usrSys = String(format: "U%.0f S%.0f", metrics.cpuUser, metrics.cpuSystem)
+        drawTextRight(usrSys, rightX: z1.maxX, y: 17.0, size: 8.5, weight: .semibold, color: NSColor(calibratedWhite: 0.72, alpha: 1.0), mono: true)
+
+        // Stacked User (cyan) + System (orange) bar + 1m Load Avg
+        let barW = max(44, z1.width - 54)
+        let barRect = CGRect(x: z1.minX, y: 6.0, width: barW, height: 5.5)
+        let barPath = CGPath(roundedRect: barRect, cornerWidth: 2.75, cornerHeight: 2.75, transform: nil)
+        ctx.saveGState()
+        ctx.addPath(barPath)
+        ctx.clip()
+        ctx.setFillColor(NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor)
+        ctx.fill(barRect)
+        let uFrac = CGFloat(min(1.0, max(0.0, metrics.cpuUser / 100.0)))
+        let sFrac = CGFloat(min(1.0 - uFrac, max(0.0, metrics.cpuSystem / 100.0)))
+        ctx.setFillColor(cyan.cgColor)
+        ctx.fill(CGRect(x: barRect.minX, y: barRect.minY, width: barRect.width * uFrac, height: barRect.height))
+        ctx.setFillColor(orange.cgColor)
+        ctx.fill(CGRect(x: barRect.minX + barRect.width * uFrac, y: barRect.minY, width: barRect.width * sFrac, height: barRect.height))
+        ctx.restoreGState()
+
+        drawTextRight(String(format: "LD %.2f", metrics.loadAvg1m), rightX: z1.maxX, y: 4.0, size: 8.2, weight: .medium, color: NSColor(calibratedWhite: 0.56, alpha: 1.0), mono: true)
+        drawDivider(ctx: ctx, x: x0 + z1W - 2, height: rect.height)
+
+        // Zone 2: Expanded 48s CPU History Graph
+        let z2 = CGRect(x: x0 + z1W + 4, y: 3, width: z2W - 10, height: rect.height - 6)
+        let peakCPU = metrics.cpuHistory.max() ?? metrics.cpuTotal
+        drawExpandedGraph(
+            ctx: ctx,
+            values: metrics.cpuHistory,
+            maxValue: 100.0,
+            rect: z2,
+            strokeColor: accent,
+            fillAlpha: 0.28,
+            guideFrac: 0.5,
+            leftTag: "48s",
+            rightTag: String(format: "PK %.0f%%", peakCPU)
+        )
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W - 2, height: rect.height)
+
+        // Zone 3: Per-Core Live E/P Breakdown Grid
+        let z3 = NSRect(x: x0 + z1W + z2W + 5, y: 0, width: z3W - 12, height: rect.height)
+        let loads = metrics.coreLoads
+        let count = loads.count
+        if count > 0 {
+            let eCount = min(metrics.eCoreCount, count)
+            let hasClusterGap = (eCount > 0 && eCount < count)
+            let clusterGap: CGFloat = hasClusterGap ? 6.0 : 0.0
+            let colGap: CGFloat = count <= 10 ? 3.5 : 2.0
+            let totalGaps = CGFloat(max(0, count - 1)) * colGap + clusterGap
+            let colW = max(12, (z3.width - totalGaps) / CGFloat(count))
+            let showPctSign = colW >= 26
+
+            var cx = z3.minX
+            for i in 0..<count {
+                if hasClusterGap && i == eCount {
+                    // Subtle hairline between E-cores and P-cores
+                    ctx.saveGState()
+                    ctx.setFillColor(NSColor(calibratedWhite: 0.22, alpha: 1.0).cgColor)
+                    ctx.fill(CGRect(x: cx + 1.0, y: 5, width: 1, height: rect.height - 10))
+                    ctx.restoreGState()
+                    cx += clusterGap
+                }
+                let load = loads[i]
+                let isE = i < eCount
+                let baseColor = isE ? cyan : orange
+                let coreColor = load >= 85 ? NSColor(calibratedRed: 1.0, green: 0.34, blue: 0.34, alpha: 1.0) : baseColor
+                let pctStr = showPctSign ? String(format: "%.0f%%", load) : String(format: "%.0f", load)
+                let labelStr = isE ? "E\(i + 1)" : "P\(i - eCount + 1)"
+
+                drawTextCentered(pctStr, centerX: cx + colW / 2.0, y: 18.0, size: colW >= 24 ? 8.2 : 7.2, weight: .bold, color: coreColor, mono: true)
+                drawRoundedBar(ctx: ctx, rect: CGRect(x: cx + 1, y: 11.5, width: max(8, colW - 2), height: 4.5), fraction: CGFloat(load / 100.0), fillColor: coreColor)
+                drawTextCentered(labelStr, centerX: cx + colW / 2.0, y: 1.5, size: 7.2, weight: .semibold, color: NSColor(calibratedWhite: 0.50, alpha: 1.0), mono: true)
+
+                cx += colW + colGap
+            }
+        }
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W + z3W - 2, height: rect.height)
+
+        // Zone 4: Rightmost Top-3 CPU Processes
+        let z4 = NSRect(x: x0 + z1W + z2W + z3W + 5, y: 0, width: max(80, z4W - 5), height: rect.height)
+        let rows = topCPUProcesses.map { (name: $0.name, value: String(format: "%.0f%%", $0.pct)) }
+        drawTopProcessColumn(ctx: ctx, rect: z4, rows: rows, accent: orange, emptyText: "No CPU procs")
+    }
+
+    // MARK: - 2. RAM Expanded Inspector (Used/Total + App/Wired/Comp/Cache/Swap + 48s Graph + Top 3)
+    private func drawRAMInspector(ctx: CGContext, rect: NSRect, accent: NSColor) {
+        let w = rect.width
+        let x0 = rect.minX
+        let green = NSColor(calibratedRed: 0.20, green: 0.83, blue: 0.60, alpha: 1.0)
+        let blue = NSColor(calibratedRed: 0.36, green: 0.62, blue: 0.98, alpha: 1.0)
+        let amber = NSColor(calibratedRed: 0.98, green: 0.73, blue: 0.22, alpha: 1.0)
+        let purple = NSColor(calibratedRed: 0.66, green: 0.56, blue: 0.92, alpha: 1.0)
+        let coral = NSColor(calibratedRed: 1.0, green: 0.42, blue: 0.38, alpha: 1.0)
+
+        let z1W = floor(w * 0.195) // Total + Segmented Bar
+        let z2W = floor(w * 0.290) // 3x2 Breakdown Grid
+        let z3W = floor(w * 0.265) // 48s History Graph
+        let z4W = w - z1W - z2W - z3W // Top 3 RAM Processes
+
+        // Zone 1: Used / Total + 4-Segment Bar
+        let z1 = NSRect(x: x0, y: 0, width: z1W - 6, height: rect.height)
+        let pct = metrics.memTotalGB > 0 ? (metrics.memUsedGB / metrics.memTotalGB) * 100.0 : 0
+        drawText(String(format: "%.1f", metrics.memUsedGB), at: NSPoint(x: z1.minX, y: 15.5), size: 11.5, weight: .bold, color: green, mono: true)
+        drawText(String(format: "/%.0fG", metrics.memTotalGB), at: NSPoint(x: z1.minX + 33, y: 16.5), size: 9.0, weight: .medium, color: NSColor(calibratedWhite: 0.54, alpha: 1.0), mono: true)
+        drawTextRight(String(format: "%.0f%%", pct), rightX: z1.maxX, y: 16.0, size: 10.0, weight: .bold, color: pct >= 85 ? coral : NSColor(calibratedWhite: 0.88, alpha: 1.0), mono: true)
+
+        let barRect = CGRect(x: z1.minX, y: 5.5, width: z1.width, height: 6.5)
+        let barPath = CGPath(roundedRect: barRect, cornerWidth: 3.25, cornerHeight: 3.25, transform: nil)
+        ctx.saveGState()
+        ctx.addPath(barPath)
+        ctx.clip()
+        ctx.setFillColor(NSColor(calibratedWhite: 0.15, alpha: 1.0).cgColor)
+        ctx.fill(barRect)
+        let cacheFrac = metrics.memTotalGB > 0 ? min(1.0, metrics.memCachedGB / metrics.memTotalGB) : 0
+        var sx = barRect.minX
+        for (frac, col) in [(CGFloat(metrics.memActiveFrac), green), (CGFloat(metrics.memWiredFrac), blue), (CGFloat(metrics.memCompressedFrac), amber), (CGFloat(cacheFrac), purple.withAlphaComponent(0.55))] {
+            let sw = max(0, min(barRect.maxX - sx, barRect.width * frac))
+            if sw > 0.5 {
+                ctx.setFillColor(col.cgColor)
+                ctx.fill(CGRect(x: sx, y: barRect.minY, width: sw, height: barRect.height))
+                sx += sw
+            }
+        }
+        ctx.restoreGState()
+        drawDivider(ctx: ctx, x: x0 + z1W - 2, height: rect.height)
+
+        // Zone 2: Detailed 3x2 Breakdown Grid (App, Wired, Compressed, Cached, Free, Swap)
+        let z2 = NSRect(x: x0 + z1W + 5, y: 0, width: z2W - 11, height: rect.height)
+        let colW = z2.width / 3.0
+        let freeGB = max(0, metrics.memTotalGB - metrics.memUsedGB)
+        let items: [(Int, Int, String, String, NSColor)] = [
+            (0, 0, "APP", String(format: "%.1fG", metrics.memAppGB), green),
+            (0, 1, "WIR", String(format: "%.1fG", metrics.memWiredGB), blue),
+            (1, 0, "CMP", String(format: "%.1fG", metrics.memCompressedGB), amber),
+            (1, 1, "CCH", String(format: "%.1fG", metrics.memCachedGB), purple),
+            (2, 0, "FRE", String(format: "%.1fG", freeGB), NSColor(calibratedWhite: 0.85, alpha: 1.0)),
+            (2, 1, "SWP", String(format: "%.1fG", metrics.swapUsedGB), metrics.swapUsedGB > 0.05 ? coral : NSColor(calibratedWhite: 0.48, alpha: 1.0))
+        ]
+        for (col, row, tag, val, color) in items {
+            let cx = z2.minX + CGFloat(col) * colW
+            let y: CGFloat = (row == 0) ? 16.5 : 4.0
+            ctx.saveGState()
+            ctx.setFillColor(color.cgColor)
+            ctx.fillEllipse(in: CGRect(x: cx, y: y + 3.0, width: 4.5, height: 4.5))
+            ctx.restoreGState()
+            drawText(tag, at: NSPoint(x: cx + 7, y: y + 0.5), size: 7.8, weight: .semibold, color: NSColor(calibratedWhite: 0.54, alpha: 1.0), mono: true)
+            drawText(val, at: NSPoint(x: cx + 31, y: y), size: 8.8, weight: .bold, color: color, mono: true)
+        }
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W - 2, height: rect.height)
+
+        // Zone 3: Expanded 48s RAM History Graph
+        let z3 = CGRect(x: x0 + z1W + z2W + 4, y: 3, width: z3W - 10, height: rect.height - 6)
+        let peakRAM = metrics.memHistory.max() ?? pct
+        drawExpandedGraph(
+            ctx: ctx,
+            values: metrics.memHistory,
+            maxValue: 100.0,
+            rect: z3,
+            strokeColor: green,
+            fillAlpha: 0.26,
+            guideFrac: 0.75,
+            leftTag: "48s",
+            rightTag: String(format: "PK %.0f%%", peakRAM)
+        )
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W + z3W - 2, height: rect.height)
+
+        // Zone 4: Rightmost Top-3 RAM Processes
+        let z4 = NSRect(x: x0 + z1W + z2W + z3W + 5, y: 0, width: max(80, z4W - 5), height: rect.height)
+        let rows = topRAMProcesses.map { proc -> (name: String, value: String) in
+            let v = proc.mb >= 1024 ? String(format: "%.1fG", proc.mb / 1024.0) : String(format: "%.0fM", proc.mb)
+            return (name: proc.name, value: v)
+        }
+        drawTopProcessColumn(ctx: ctx, rect: z4, rows: rows, accent: green, emptyText: "No RAM procs")
+    }
+
+    // MARK: - 3. M2 Thermal & Fan Expanded Inspector (Die Avg/Peak + P/E/SoC Clusters + Temp Graph + Fan Gauge)
+    private func drawThermalInspector(ctx: CGContext, rect: NSRect, accent: NSColor) {
+        let w = rect.width
+        let x0 = rect.minX
+
+        let z1W = floor(w * 0.195) // Die Avg + Peak + Thermal State
+        let z2W = floor(w * 0.245) // P-Core / E-Core / SoC Cluster Temps
+        let z3W = floor(w * 0.290) // Thermal History Sparkline
+        let z4W = w - z1W - z2W - z3W // Fan Telemetry Gauge
+
+        // Zone 1: Avg & Peak + Thermal State
+        let z1 = NSRect(x: x0, y: 0, width: z1W - 6, height: rect.height)
+        let avgStr = metrics.socTempC > 0 ? String(format: "%.0f°C", metrics.socTempC) : "--°C"
+        drawText(avgStr, at: NSPoint(x: z1.minX, y: 15.5), size: 12, weight: .bold, color: accent, mono: true)
+        if metrics.socPeakTempC > 0 {
+            drawTextRight(String(format: "PK %.0f°", metrics.socPeakTempC), rightX: z1.maxX, y: 16.5, size: 9.0, weight: .semibold, color: tempColor(for: metrics.socPeakTempC), mono: true)
+        }
+
+        let (stateLabel, stateColor): (String, NSColor) = {
+            switch metrics.thermalStateRaw {
+            case 0: return ("NOMINAL", NSColor(calibratedRed: 0.24, green: 0.88, blue: 0.56, alpha: 1.0))
+            case 1: return ("FAIR", NSColor(calibratedRed: 0.98, green: 0.78, blue: 0.22, alpha: 1.0))
+            case 2: return ("SERIOUS", NSColor(calibratedRed: 0.99, green: 0.54, blue: 0.20, alpha: 1.0))
+            default: return ("CRITICAL", NSColor(calibratedRed: 1.0, green: 0.30, blue: 0.30, alpha: 1.0))
+            }
+        }()
+        drawText(stateLabel, at: NSPoint(x: z1.minX, y: 4.5), size: 8.2, weight: .bold, color: stateColor, mono: true)
+        if metrics.batteryTempC > 0 {
+            drawTextRight(String(format: "BAT %.0f°", metrics.batteryTempC), rightX: z1.maxX, y: 4.5, size: 8.2, weight: .medium, color: NSColor(calibratedWhite: 0.56, alpha: 1.0), mono: true)
+        }
+        drawDivider(ctx: ctx, x: x0 + z1W - 2, height: rect.height)
+
+        // Zone 2: Cluster Temps (P-Core, E-Core, SoC Die)
+        let z2 = NSRect(x: x0 + z1W + 5, y: 0, width: z2W - 11, height: rect.height)
+        let clusters: [(String, Double)] = [
+            ("P-CORE", metrics.pCoreTempC > 0 ? metrics.pCoreTempC : metrics.socPeakTempC),
+            ("E-CORE", metrics.eCoreTempC > 0 ? metrics.eCoreTempC : metrics.socTempC),
+            ("SoC DIE", metrics.socClusterTempC > 0 ? metrics.socClusterTempC : metrics.socTempC)
+        ]
+        let colGap: CGFloat = 6
+        let colW = (z2.width - colGap * 2) / 3.0
+        for (i, (label, t)) in clusters.enumerated() {
+            let cx = z2.minX + CGFloat(i) * (colW + colGap)
+            let col = tempColor(for: t)
+            let tStr = t > 0 ? String(format: "%.0f°C", t) : "--"
+            drawTextCentered(tStr, centerX: cx + colW / 2.0, y: 18.0, size: 9.0, weight: .bold, color: col, mono: true)
+            let frac = t > 0 ? CGFloat(min(1.0, max(0.0, (t - 25.0) / 75.0))) : 0
+            drawRoundedBar(ctx: ctx, rect: CGRect(x: cx, y: 11.5, width: colW, height: 4.5), fraction: frac, fillColor: col)
+            drawTextCentered(label, centerX: cx + colW / 2.0, y: 1.5, size: 7.2, weight: .semibold, color: NSColor(calibratedWhite: 0.52, alpha: 1.0), mono: true)
+        }
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W - 2, height: rect.height)
+
+        // Zone 3: Expanded Thermal History Graph
+        let z3 = CGRect(x: x0 + z1W + z2W + 4, y: 3, width: z3W - 10, height: rect.height - 6)
+        let validTemps = metrics.tempHistory.filter { $0 > 0 }
+        let minT = validTemps.min() ?? max(30, metrics.socTempC)
+        let maxT = validTemps.max() ?? max(30, metrics.socTempC)
+        drawExpandedGraph(
+            ctx: ctx,
+            values: metrics.tempHistory,
+            minValue: 25.0,
+            maxValue: 100.0,
+            rect: z3,
+            strokeColor: accent,
+            fillAlpha: 0.25,
+            guideFrac: (65.0 - 25.0) / 75.0,
+            leftTag: validTemps.isEmpty ? "TEMP" : String(format: "LO %.0f°", minT),
+            rightTag: validTemps.isEmpty ? nil : String(format: "HI %.0f°", maxT)
+        )
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W + z3W - 2, height: rect.height)
+
+        // Zone 4: Fan Telemetry Gauge
+        let z4 = NSRect(x: x0 + z1W + z2W + z3W + 6, y: 0, width: max(100, z4W - 6), height: rect.height)
+        let fanColor = metrics.fanRPM > 4000
+            ? NSColor(calibratedRed: 0.99, green: 0.62, blue: 0.24, alpha: 1.0)
+            : NSColor(calibratedRed: 0.56, green: 0.66, blue: 0.98, alpha: 1.0)
+        if metrics.fanAvailable {
+            let fanPct = metrics.fanMaxRPM > 0 ? min(100, Int(round((metrics.fanRPM / metrics.fanMaxRPM) * 100.0))) : 0
+            let rpmText = metrics.fanRPM < 100 ? "FAN 0 RPM (SILENT)" : String(format: "FAN %.0f RPM", metrics.fanRPM)
+            drawText(rpmText, at: NSPoint(x: z4.minX, y: 16.0), size: 9.5, weight: .bold, color: metrics.fanRPM < 100 ? NSColor(calibratedWhite: 0.56, alpha: 1.0) : fanColor, mono: true)
+            drawTextRight("\(fanPct)%", rightX: z4.maxX, y: 16.0, size: 9.5, weight: .bold, color: fanColor, mono: true)
+
+            let barW = max(60, z4.width - 54)
+            let frac = metrics.fanMaxRPM > 0 ? CGFloat(min(1.0, max(0.0, metrics.fanRPM / metrics.fanMaxRPM))) : 0
+            drawRoundedBar(ctx: ctx, rect: CGRect(x: z4.minX, y: 6.0, width: barW, height: 6.0), fraction: frac, fillColor: fanColor)
+            drawTextRight(String(format: "MAX %.1fk", metrics.fanMaxRPM / 1000.0), rightX: z4.maxX, y: 4.0, size: 8.0, weight: .medium, color: NSColor(calibratedWhite: 0.50, alpha: 1.0), mono: true)
+        } else {
+            drawText("FAN PASSIVE", at: NSPoint(x: z4.minX, y: 16.0), size: 9.5, weight: .bold, color: NSColor(calibratedWhite: 0.56, alpha: 1.0), mono: true)
+            drawText("No active cooling fan detected", at: NSPoint(x: z4.minX, y: 4.5), size: 8.0, weight: .medium, color: NSColor(calibratedWhite: 0.42, alpha: 1.0))
+        }
+    }
+
+    // MARK: - 4. Power & Battery Expanded Inspector (Sys/In/Batt Flow + 48s Watt Graph + Battery + Health/Cycles)
+    private func drawPowerInspector(ctx: CGContext, rect: NSRect, accent: NSColor) {
+        let w = rect.width
+        let x0 = rect.minX
+        let cyan = NSColor(calibratedRed: 0.28, green: 0.84, blue: 0.98, alpha: 1.0)
+        let green = NSColor(calibratedRed: 0.24, green: 0.90, blue: 0.54, alpha: 1.0)
+        let amber = NSColor(calibratedRed: 0.99, green: 0.68, blue: 0.24, alpha: 1.0)
+        let red = NSColor(calibratedRed: 1.0, green: 0.36, blue: 0.34, alpha: 1.0)
+
+        let z1W = floor(w * 0.245) // Live Wattage Flow
+        let z2W = floor(w * 0.320) // Expanded 48s Power Graph
+        let z3W = floor(w * 0.230) // Battery % + Gauge + Time
+        let z4W = w - z1W - z2W - z3W // Health / Cycles / V / Temp
+
+        let sysColor = metrics.powerWatts >= 20 ? red : (metrics.powerWatts >= 12 ? amber : cyan)
+
+        // Zone 1: Live Power Flow (SYS / IN / BATT / PD)
+        let z1 = NSRect(x: x0, y: 0, width: z1W - 6, height: rect.height)
+        drawText("SYS", at: NSPoint(x: z1.minX, y: 17.0), size: 8.2, weight: .semibold, color: NSColor(calibratedWhite: 0.52, alpha: 1.0))
+        drawText(String(format: "%.1fW", metrics.powerWatts), at: NSPoint(x: z1.minX + 24, y: 16.0), size: 10.5, weight: .bold, color: sysColor, mono: true)
+        let inColor = metrics.isPluggedIn ? green : NSColor(calibratedWhite: 0.42, alpha: 1.0)
+        drawTextRight(String(format: "%@ %.1fW", metrics.isPluggedIn ? "⚡IN" : "IN", metrics.chargerInWatts), rightX: z1.maxX, y: 16.0, size: 9.5, weight: .bold, color: inColor, mono: true)
+
+        let battFlowColor = metrics.batteryNetWatts >= 0.1 ? green : (metrics.batteryNetWatts <= -0.1 ? amber : NSColor(calibratedWhite: 0.55, alpha: 1.0))
+        drawText(String(format: "BATT %+.1fW", metrics.batteryNetWatts), at: NSPoint(x: z1.minX, y: 4.0), size: 8.8, weight: .semibold, color: battFlowColor, mono: true)
+        let adapterStr = metrics.isPluggedIn
+            ? (metrics.adapterMaxWatts > 0 ? "\(metrics.adapterMaxWatts)W PD" : "AC POWER")
+            : "ON BATT"
+        drawTextRight(adapterStr, rightX: z1.maxX, y: 4.5, size: 8.2, weight: .semibold, color: NSColor(calibratedWhite: 0.58, alpha: 1.0), mono: true)
+        drawDivider(ctx: ctx, x: x0 + z1W - 2, height: rect.height)
+
+        // Zone 2: Expanded 48s Power Draw + Charger In Graph
+        let z2 = CGRect(x: x0 + z1W + 4, y: 3, width: z2W - 10, height: rect.height - 6)
+        let peakDraw = metrics.powerHistory.max() ?? metrics.powerWatts
+        let peakIn = metrics.isPluggedIn ? (metrics.chargerInHistory.max() ?? metrics.chargerInWatts) : 0
+        let maxW = max(15.0, max(peakDraw, peakIn) * 1.15)
+        drawExpandedGraph(
+            ctx: ctx,
+            values: metrics.powerHistory,
+            secondaryValues: metrics.isPluggedIn ? metrics.chargerInHistory : nil,
+            maxValue: maxW,
+            rect: z2,
+            strokeColor: sysColor,
+            secondaryColor: green,
+            fillAlpha: 0.25,
+            guideFrac: 0.5,
+            leftTag: "DRAW 48s",
+            rightTag: String(format: "PK %.1fW", peakDraw),
+            rightTagColor: sysColor
+        )
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W - 2, height: rect.height)
+
+        // Zone 3: Battery Percentage + Wide Gauge + Time Remaining
+        let z3 = NSRect(x: x0 + z1W + z2W + 6, y: 0, width: z3W - 12, height: rect.height)
+        let battColor = (metrics.batteryPercent <= 15 && !metrics.isPluggedIn) ? red : (metrics.isCharging ? green : NSColor(calibratedWhite: 0.88, alpha: 1.0))
+        drawText("\(metrics.batteryPercent)%", at: NSPoint(x: z3.minX, y: 15.5), size: 11.5, weight: .bold, color: battColor, mono: true)
+        let statusStr = metrics.isCharging ? "CHARGING" : (metrics.isPluggedIn ? "PLUGGED" : "BATTERY")
+        drawText(statusStr, at: NSPoint(x: z3.minX + 38, y: 17.0), size: 8.0, weight: .semibold, color: NSColor(calibratedWhite: 0.56, alpha: 1.0))
+        if let mins = metrics.minutesRemaining {
+            let remStr = String(format: "%dh%02dm", mins / 60, mins % 60)
+            drawTextRight(remStr, rightX: z3.maxX, y: 16.5, size: 8.8, weight: .bold, color: battColor, mono: true)
+        }
+        drawRoundedBar(ctx: ctx, rect: CGRect(x: z3.minX, y: 5.5, width: z3.width, height: 6.5), fraction: CGFloat(metrics.batteryPercent) / 100.0, fillColor: battColor)
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W + z3W - 2, height: rect.height)
+
+        // Zone 4: Battery Health, Cycles, Voltage & Battery Temp
+        let z4 = NSRect(x: x0 + z1W + z2W + z3W + 6, y: 0, width: max(90, z4W - 6), height: rect.height)
+        let healthStr = metrics.batteryHealthPct > 0 ? "HLTH \(metrics.batteryHealthPct)%" : "HLTH --"
+        let healthColor = metrics.batteryHealthPct >= 85 ? green : (metrics.batteryHealthPct >= 75 ? accent : red)
+        drawText(healthStr, at: NSPoint(x: z4.minX, y: 16.5), size: 8.8, weight: .bold, color: metrics.batteryHealthPct > 0 ? healthColor : NSColor(calibratedWhite: 0.52, alpha: 1.0), mono: true)
+        let cycStr = metrics.batteryCycleCount > 0 ? "\(metrics.batteryCycleCount) CYC" : "-- CYC"
+        drawTextRight(cycStr, rightX: z4.maxX, y: 16.5, size: 8.5, weight: .medium, color: NSColor(calibratedWhite: 0.70, alpha: 1.0), mono: true)
+
+        let voltStr = metrics.batteryVoltageV > 0 ? String(format: "%.2fV", metrics.batteryVoltageV) : "--V"
+        drawText(voltStr, at: NSPoint(x: z4.minX, y: 4.0), size: 8.8, weight: .semibold, color: cyan, mono: true)
+        let btStr = metrics.batteryTempC > 0 ? String(format: "%.1f°C", metrics.batteryTempC) : "--°C"
+        drawTextRight(btStr, rightX: z4.maxX, y: 4.0, size: 8.5, weight: .semibold, color: tempColor(for: metrics.batteryTempC), mono: true)
+    }
+
+    // MARK: - 5. Network & Privacy Expanded Inspector (Down/Up + Dual Graph + Interface/Session Totals + Tunnel Pills)
+    private func drawNetworkInspector(ctx: CGContext, rect: NSRect, accent: NSColor) {
+        let w = rect.width
+        let x0 = rect.minX
+        let downColor = NSColor(calibratedRed: 0.24, green: 0.80, blue: 0.99, alpha: 1.0)
+        let upColor = NSColor(calibratedRed: 0.68, green: 0.54, blue: 0.99, alpha: 1.0)
+
+        let z1W = floor(w * 0.220) // Live Down/Up + Peak
+        let z2W = floor(w * 0.365) // Expanded Dual Sparkline
+        let z3W = floor(w * 0.235) // Interface/IP + Session Totals
+        let z4W = w - z1W - z2W - z3W // TS / VPN / Proxy Pills
+
+        // Zone 1: Live Throughput + Peaks
+        let z1 = NSRect(x: x0, y: 0, width: z1W - 6, height: rect.height)
+        let peakDown = metrics.netDownHistory.max() ?? metrics.netDownBps
+        let peakUp = metrics.netUpHistory.max() ?? metrics.netUpBps
+        drawText("↓ " + formatSpeed(metrics.netDownBps), at: NSPoint(x: z1.minX, y: 16.0), size: 10.0, weight: .bold, color: downColor, mono: true)
+        drawTextRight("PK " + formatSpeedCompact(peakDown), rightX: z1.maxX, y: 17.0, size: 8.0, weight: .medium, color: downColor.withAlphaComponent(0.65), mono: true)
+
+        drawText("↑ " + formatSpeed(metrics.netUpBps), at: NSPoint(x: z1.minX, y: 4.0), size: 9.5, weight: .bold, color: upColor, mono: true)
+        drawTextRight("PK " + formatSpeedCompact(peakUp), rightX: z1.maxX, y: 4.5, size: 8.0, weight: .medium, color: upColor.withAlphaComponent(0.65), mono: true)
+        drawDivider(ctx: ctx, x: x0 + z1W - 2, height: rect.height)
+
+        // Zone 2: Expanded Dual Down + Up History Graph
+        let z2 = CGRect(x: x0 + z1W + 4, y: 3, width: z2W - 10, height: rect.height - 6)
+        let maxBps = max(64.0 * 1024.0, max(peakDown, peakUp) * 1.15)
+        drawExpandedGraph(
+            ctx: ctx,
+            values: metrics.netDownHistory,
+            secondaryValues: metrics.netUpHistory,
+            maxValue: maxBps,
+            rect: z2,
+            strokeColor: downColor,
+            secondaryColor: upColor,
+            fillAlpha: 0.25,
+            guideFrac: 0.5,
+            leftTag: "↓/↑ 36s",
+            rightTag: formatSpeed(maxBps),
+            rightTagColor: NSColor(calibratedWhite: 0.62, alpha: 1.0)
+        )
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W - 2, height: rect.height)
+
+        // Zone 3: Primary Interface / Local IP + Session Totals
+        let z3 = NSRect(x: x0 + z1W + z2W + 6, y: 0, width: z3W - 12, height: rect.height)
+        let ifLabel = metrics.primaryInterface.isEmpty ? "OFFLINE" : metrics.primaryInterface.uppercased()
+        drawText(ifLabel, at: NSPoint(x: z3.minX, y: 16.5), size: 8.8, weight: .bold, color: metrics.primaryInterface.isEmpty ? NSColor.systemRed : downColor, mono: true)
+        let ipLabel = metrics.localIPv4.isEmpty ? "No IPv4" : metrics.localIPv4
+        drawTextRight(ipLabel, rightX: z3.maxX, y: 16.5, size: 8.8, weight: .medium, color: NSColor(calibratedWhite: 0.84, alpha: 1.0), mono: true)
+
+        let sessDown = formatBytesCompact(metrics.sessionDownBytes)
+        let sessUp = formatBytesCompact(metrics.sessionUpBytes)
+        drawText("Σ ↓\(sessDown)", at: NSPoint(x: z3.minX, y: 4.0), size: 8.5, weight: .semibold, color: downColor.withAlphaComponent(0.85), mono: true)
+        drawTextRight("↑\(sessUp)", rightX: z3.maxX, y: 4.0, size: 8.5, weight: .semibold, color: upColor.withAlphaComponent(0.85), mono: true)
+        drawDivider(ctx: ctx, x: x0 + z1W + z2W + z3W - 2, height: rect.height)
+
+        // Zone 4: Privacy & Tunnel Status Pills (TS / VPN / PRX)
+        let z4 = NSRect(x: x0 + z1W + z2W + z3W + 6, y: 0, width: max(90, z4W - 6), height: rect.height)
+        let pills: [(String, Bool, NSColor)] = [
+            ("TS", metrics.tailscaleActive, NSColor(calibratedRed: 0.18, green: 0.86, blue: 0.56, alpha: 1.0)),
+            ("VPN", metrics.vpnActive, NSColor(calibratedRed: 0.99, green: 0.74, blue: 0.20, alpha: 1.0)),
+            ("PRX", metrics.proxyActive, NSColor(calibratedRed: 0.24, green: 0.80, blue: 0.99, alpha: 1.0))
+        ]
+        let gap: CGFloat = 4
+        let pillW = (z4.width - gap * 2) / 3.0
+        for (i, (lbl, active, col)) in pills.enumerated() {
+            let pr = CGRect(x: z4.minX + CGFloat(i) * (pillW + gap), y: 14.5, width: pillW, height: 12.5)
+            let pPath = CGPath(roundedRect: pr, cornerWidth: 3.5, cornerHeight: 3.5, transform: nil)
+            ctx.saveGState()
+            ctx.setFillColor((active ? col.withAlphaComponent(0.24) : NSColor(calibratedWhite: 0.12, alpha: 1.0)).cgColor)
+            ctx.addPath(pPath)
+            ctx.fillPath()
+            if active {
+                ctx.setStrokeColor(col.withAlphaComponent(0.85).cgColor)
+                ctx.setLineWidth(0.8)
+                ctx.addPath(pPath)
+                ctx.strokePath()
+            }
+            ctx.restoreGState()
+            drawTextCentered(lbl, centerX: pr.midX, y: 16.0, size: 7.8, weight: .bold, color: active ? col : NSColor(calibratedWhite: 0.38, alpha: 1.0), mono: true)
+        }
+
+        let anyTunnel = metrics.tailscaleActive || metrics.vpnActive || metrics.proxyActive
+        let statusTxt = anyTunnel ? "TUNNEL ACTIVE" : "DIRECT LINK"
+        drawTextCentered(statusTxt, centerX: z4.midX, y: 3.0, size: 7.5, weight: .semibold, color: anyTunnel ? NSColor(calibratedRed: 0.20, green: 0.86, blue: 0.56, alpha: 0.9) : NSColor(calibratedWhite: 0.46, alpha: 1.0), mono: true)
+    }
+
+    private func formatBytesCompact(_ bytes: UInt64) -> String {
+        let d = Double(bytes)
+        if d >= 1024 * 1024 * 1024 {
+            return String(format: "%.1fGB", d / (1024 * 1024 * 1024))
+        } else if d >= 1024 * 1024 {
+            return String(format: "%.0fMB", d / (1024 * 1024))
+        } else if d >= 1024 {
+            return String(format: "%.0fKB", d / 1024)
+        } else {
+            return "\(bytes)B"
+        }
     }
 
     // MARK: - Full-Width Gentle Breathing Amber Flash (Coding Agent Turn Complete)
@@ -2141,31 +2849,55 @@ final class CockpitView: NSView {
         // Realistic Apple Silicon M2 sample telemetry
         var m = SystemMetrics()
         m.cpuTotal = 41
+        m.cpuUser = 29
+        m.cpuSystem = 12
+        m.loadAvg1m = 2.41
         m.eCoreCount = 4
         m.coreLoads = [28, 35, 22, 40, 74, 62, 58, 49]
         m.cpuHistory = [18, 22, 20, 26, 31, 28, 34, 42, 48, 52, 45, 38, 35, 40, 56, 68, 72, 64, 58, 49, 44, 39, 43, 51, 47, 42, 36, 33, 38, 46, 54, 61, 58, 49, 44, 41, 37, 35, 39, 44, 48, 43, 40, 42, 46, 44, 41, 41]
         m.memUsedGB = 11.6
         m.memTotalGB = 16
+        m.memAppGB = 7.0
+        m.memWiredGB = 2.6
+        m.memCompressedGB = 2.0
+        m.memCachedGB = 3.1
         m.memActiveFrac = 0.44
         m.memWiredFrac = 0.16
         m.memCompressedFrac = 0.12
         m.swapUsedGB = 0.0
+        m.memHistory = [62, 63, 64, 64, 65, 66, 67, 68, 68, 69, 70, 71, 72, 72, 73, 74, 73, 72, 72, 71, 70, 71, 72, 73, 74, 75, 75, 74, 73, 73, 72, 72, 73, 73, 74, 74, 73, 73, 72, 72, 72, 73, 73, 72, 72, 72, 73, 73]
         m.socTempC = 58
-        m.socPeakTempC = 63
+        m.socPeakTempC = 64
+        m.pCoreTempC = 62
+        m.eCoreTempC = 54
+        m.socClusterTempC = 57
         m.fanAvailable = true
         m.fanRPM = 2150
         m.fanMaxRPM = 7200
+        m.thermalStateRaw = 0
+        m.tempHistory = [46, 47, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60, 62, 64, 63, 61, 60, 59, 58, 57, 56, 57, 58, 59, 60, 61, 60, 59, 58, 57, 56, 57, 58, 59, 59, 58, 57, 57, 58, 59, 58, 58, 58, 58, 58]
         m.powerWatts = 14.2
         m.chargerInWatts = 36.8
         m.batteryNetWatts = 22.6
         m.adapterMaxWatts = 45
         m.batteryPercent = 84
+        m.batteryHealthPct = 94
+        m.batteryCycleCount = 142
+        m.batteryTempC = 31.2
+        m.batteryVoltageV = 12.42
         m.isPluggedIn = true
         m.isCharging = true
+        m.minutesRemaining = 42
+        m.powerHistory = [8.2, 9.1, 8.8, 10.4, 11.2, 12.0, 14.5, 16.2, 18.4, 17.0, 15.2, 13.8, 12.4, 11.8, 13.0, 15.6, 19.2, 21.4, 18.8, 16.4, 15.0, 13.8, 14.2, 15.1, 14.8, 13.6, 12.9, 13.4, 14.6, 15.8, 16.2, 15.4, 14.2, 13.8, 14.0, 14.5, 15.1, 14.6, 13.9, 14.1, 14.4, 14.8, 14.5, 14.2, 14.0, 14.3, 14.2, 14.2]
+        m.chargerInHistory = [32, 34, 35, 36, 36, 37, 38, 39, 40, 39, 38, 37, 36, 36, 37, 38, 41, 42, 40, 38, 37, 36, 36, 37, 37, 36, 36, 36, 37, 38, 38, 37, 37, 36, 36, 37, 37, 37, 36, 37, 37, 37, 37, 37, 37, 37, 36.8, 36.8]
         m.netDownBps = 2.4 * 1024 * 1024
         m.netUpBps = 185 * 1024
         m.netDownHistory = [120, 240, 310, 480, 920, 1400, 1850, 2200, 1950, 1600, 1100, 840, 620, 950, 1500, 2450, 2800, 2300, 1900, 1700, 1450, 1200, 1650, 2100, 2500, 2250, 1800, 1550, 1300, 1750, 2200, 2600, 2400, 2100, 2350, 2450].map { $0 * 1024.0 }
         m.netUpHistory = [40, 65, 80, 110, 140, 210, 190, 160, 130, 120, 95, 110, 150, 220, 280, 240, 190, 170, 150, 130, 140, 180, 210, 250, 220, 190, 160, 145, 175, 205, 195, 180, 165, 175, 190, 185].map { $0 * 1024.0 }
+        m.primaryInterface = "en0"
+        m.localIPv4 = "192.168.1.42"
+        m.sessionDownBytes = 1_480_000_000
+        m.sessionUpBytes = 218_000_000
         m.tailscaleActive = true
         m.vpnActive = true
         m.proxyActive = false
@@ -2283,5 +3015,19 @@ final class CockpitView: NSView {
         // 5. Eyes-Free Volume Slider HUD
         view.activeHUD = .volume(value: 0.68, muted: false)
         saveFramed("slider-volume.png")
+
+        // 6. Expanded Live Telemetry Inspectors
+        view.topCPUProcesses = [("swift-frontend", 64.2), ("WindowServer", 18.4), ("ghostty", 7.1)]
+        view.topRAMProcesses = [("Zen Browser", 2480), ("Xcode", 1890), ("WindowServer", 640)]
+        view.activeHUD = .inspector(.cpu)
+        saveFramed("inspector-cpu.png")
+        view.activeHUD = .inspector(.ram)
+        saveFramed("inspector-ram.png")
+        view.activeHUD = .inspector(.thermal)
+        saveFramed("inspector-thermal.png")
+        view.activeHUD = .inspector(.power)
+        saveFramed("inspector-power.png")
+        view.activeHUD = .inspector(.network)
+        saveFramed("inspector-network.png")
     }
 }
