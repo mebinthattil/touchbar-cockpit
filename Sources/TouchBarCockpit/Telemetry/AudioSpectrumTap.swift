@@ -2,6 +2,7 @@ import Foundation
 import CoreAudio
 import AudioToolbox
 import Accelerate
+import IOKit.pwr_mgt
 import CPrivateAPIs
 
 /// Ultra-lightweight native macOS 14.2+ CoreAudio Process Tap + 512-pt vDSP FFT
@@ -50,10 +51,18 @@ final class AudioSpectrumTap {
     private var smoothedBands: [Float] = Array(repeating: 0, count: bandCount)
     private var lastEmittedBands: [Float] = Array(repeating: -1, count: bandCount)
     private var rollingPeak: Float = 0.08
+    private var tapStartTime: CFAbsoluteTime = 0
     private var lastSoundTime: CFAbsoluteTime = 0
     private(set) var isAudioActive: Bool = false
     private var isTimerInFastMode: Bool = false
     private var uiTimer: Timer?
+
+    // Silent-holder suppression: if an app (e.g. a paused browser tab) holds an open silent
+    // CoreAudio output stream (runOut == 1, RMS == 0), we tear down our CATap after a few seconds
+    // so macOS clears the "System Audio Recording" privacy indicator & sleep assertion, and only
+    // re-arm when a new process outputs audio, the stream restarts, or playback resumes.
+    private var suppressedSilentPIDs: Set<pid_t> = []
+    private var suppressedAssertionIDs: Set<Int> = []
 
     init() {
         ringBuffer = UnsafeMutablePointer<Float>.allocate(capacity: Self.ringMask + 1)
@@ -81,24 +90,63 @@ final class AudioSpectrumTap {
         ringWriteIndex.deallocate()
     }
 
-    // MARK: - Smart Idle-Gated Poll (Handles output device switches like Speakers <-> AirPods cleanly!)
+    // MARK: - Smart Idle-Gated Poll (Per-Process Output Tracking + Silence Auto-Teardown)
     func checkOutputActivity() {
-        let (devID, outputRunning) = Self.defaultOutputStatus()
-        if outputRunning {
-            if isTapRunning && devID != 0 && activeOutputDeviceID != 0 && devID != activeOutputDeviceID {
-                // Default output device switched (e.g. connected AirPods) -> cleanly restart tap
-                stop()
-            }
-            if !isTapRunning {
-                activeOutputDeviceID = devID
-                start()
-            }
-        } else {
+        let devID = Self.defaultOutputDeviceID()
+        let activeOutPIDs = Self.runningOutputProcessPIDs()
+
+        // No OTHER process is outputting audio at all -> tear down tap immediately!
+        // (Avoids self-sustaining loop where our own global CATap kept DeviceIsRunningSomewhere == 1.)
+        if activeOutPIDs.isEmpty {
+            suppressedSilentPIDs.removeAll()
+            suppressedAssertionIDs.removeAll()
             if isTapRunning || isAudioActive {
                 stop()
             }
             activeOutputDeviceID = 0
+            return
         }
+
+        // Default output device switched (e.g. Speakers <-> AirPods) -> clear suppression & restart cleanly
+        if devID != 0 && activeOutputDeviceID != 0 && devID != activeOutputDeviceID {
+            suppressedSilentPIDs.removeAll()
+            suppressedAssertionIDs.removeAll()
+            if isTapRunning {
+                stop()
+            }
+        }
+
+        // Prune any previously-silent PID that has since closed its audio output stream
+        if !suppressedSilentPIDs.isEmpty {
+            suppressedSilentPIDs.formIntersection(activeOutPIDs)
+            if suppressedSilentPIDs.isEmpty {
+                suppressedAssertionIDs.removeAll()
+            }
+        }
+
+        // If all currently-running output PIDs were suppressed for digital silence, check whether
+        // any of them opened a NEW CoreAudio stream assertion or video/media assertion (e.g. hit Play in browser)
+        if !isTapRunning && !suppressedSilentPIDs.isEmpty {
+            let currentIDs = Self.audioAssertionIDs(for: suppressedSilentPIDs)
+            if !currentIDs.subtracting(suppressedAssertionIDs).isEmpty {
+                suppressedSilentPIDs.removeAll()
+                suppressedAssertionIDs.removeAll()
+            }
+        }
+
+        let unsuppressed = activeOutPIDs.subtracting(suppressedSilentPIDs)
+        if !unsuppressed.isEmpty && !isTapRunning {
+            activeOutputDeviceID = devID
+            start()
+        }
+    }
+
+    /// Called when an external playback event occurs (e.g. Spotify/Apple Music notification or media play action)
+    /// so any suppressed silent-holder PID is immediately re-checked.
+    func nudgeWake() {
+        suppressedSilentPIDs.removeAll()
+        suppressedAssertionIDs.removeAll()
+        checkOutputActivity()
     }
 
     // MARK: - Start / Stop CoreAudio Process Tap
@@ -209,6 +257,8 @@ final class AudioSpectrumTap {
         }
 
         isTapRunning = true
+        tapStartTime = CFAbsoluteTimeGetCurrent()
+        lastSoundTime = 0
         setUITimerCadence(fast: true)
     }
 
@@ -288,7 +338,7 @@ final class AudioSpectrumTap {
             }
         }
 
-        let shouldBeActive = hasSignal || (now - lastSoundTime) < 1.25
+        let shouldBeActive = hasSignal || (lastSoundTime > 0 && (now - lastSoundTime) < 1.25)
 
         if !shouldBeActive {
             if isAudioActive {
@@ -299,6 +349,19 @@ final class AudioSpectrumTap {
             }
             if isTimerInFastMode {
                 setUITimerCadence(fast: false)
+            }
+
+            // Tear down the CoreAudio Process Tap completely after sustained digital silence so macOS
+            // turns OFF the "System Audio Recording" indicator and releases the coreaudiod sleep assertion.
+            let silentFor = lastSoundTime > 0 ? (now - lastSoundTime) : (now - tapStartTime)
+            let teardownThreshold: CFAbsoluteTime = lastSoundTime > 0 ? 6.0 : 4.0
+            if silentFor >= teardownThreshold {
+                let silentPIDs = Self.runningOutputProcessPIDs()
+                if !silentPIDs.isEmpty {
+                    suppressedSilentPIDs.formUnion(silentPIDs)
+                    suppressedAssertionIDs = Self.audioAssertionIDs(for: suppressedSilentPIDs)
+                }
+                stop()
             }
             return
         }
@@ -367,8 +430,8 @@ final class AudioSpectrumTap {
         }
     }
 
-    // MARK: - CoreAudio Output Activity & Device ID Check (0.001% CPU!)
-    private static func defaultOutputStatus() -> (deviceID: AudioDeviceID, isRunning: Bool) {
+    // MARK: - CoreAudio Per-Process Output Activity & Device ID Check (Zero Self-Triggering)
+    private static func defaultOutputDeviceID() -> AudioDeviceID {
         var dev = AudioDeviceID(0)
         var devSize = UInt32(MemoryLayout<AudioDeviceID>.size)
         var devAddr = AudioObjectPropertyAddress(
@@ -383,20 +446,107 @@ final class AudioSpectrumTap {
             nil,
             &devSize,
             &dev
-        ) == noErr, dev != 0 else {
-            return (0, false)
+        ) == noErr else {
+            return 0
         }
+        return dev
+    }
 
-        var running: UInt32 = 0
-        var runSize = UInt32(MemoryLayout<UInt32>.size)
-        var runAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+    /// Returns PIDs of OTHER processes currently running CoreAudio output (strictly excluding ourselves).
+    private static func runningOutputProcessPIDs() -> Set<pid_t> {
+        let selfPID = getpid()
+        var listAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        guard AudioObjectGetPropertyData(dev, &runAddr, 0, nil, &runSize, &running) == noErr else {
-            return (dev, false)
+        var byteSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &listAddr,
+            0,
+            nil,
+            &byteSize
+        ) == noErr, byteSize > 0 else {
+            return []
         }
-        return (dev, running != 0)
+
+        let count = Int(byteSize) / MemoryLayout<AudioObjectID>.size
+        var procObjects = [AudioObjectID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &listAddr,
+            0,
+            nil,
+            &byteSize,
+            &procObjects
+        ) == noErr else {
+            return []
+        }
+
+        var result: Set<pid_t> = []
+        var runOutAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyIsRunningOutput,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var pidAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyPID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        for obj in procObjects {
+            var runOut: UInt32 = 0
+            var runSize = UInt32(MemoryLayout<UInt32>.size)
+            guard AudioObjectGetPropertyData(obj, &runOutAddr, 0, nil, &runSize, &runOut) == noErr,
+                  runOut != 0 else {
+                continue
+            }
+            var pid: pid_t = 0
+            var pidSize = UInt32(MemoryLayout<pid_t>.size)
+            if AudioObjectGetPropertyData(obj, &pidAddr, 0, nil, &pidSize, &pid) == noErr,
+               pid > 0, pid != selfPID {
+                result.insert(pid)
+            }
+        }
+        return result
+    }
+
+    /// Snapshots IOKit power assertion IDs associated with suppressed silent-holder PIDs
+    /// (both coreaudiod output assertions on behalf of the PID and browser media/video display-sleep assertions).
+    private static func audioAssertionIDs(for targetPIDs: Set<pid_t>) -> Set<Int> {
+        guard !targetPIDs.isEmpty else { return [] }
+        var ref: Unmanaged<CFDictionary>?
+        guard IOPMCopyAssertionsByProcess(&ref) == kIOReturnSuccess,
+              let dict = ref?.takeRetainedValue() as? [NSNumber: [[String: Any]]] else {
+            return []
+        }
+
+        var ids: Set<Int> = []
+        for (ownerNum, assertions) in dict {
+            let ownerPID = pid_t(ownerNum.int32Value)
+            for a in assertions {
+                guard let assertID = a["AssertionId"] as? Int else { continue }
+                if let behalfPID = a["AssertionOnBehalfOfPID"] as? Int,
+                   targetPIDs.contains(pid_t(behalfPID)) {
+                    ids.insert(assertID)
+                    continue
+                }
+                if targetPIDs.contains(ownerPID) {
+                    let assertType = a["AssertType"] as? String ?? ""
+                    let assertName = (a["AssertName"] as? String ?? "").lowercased()
+                    if assertType == "PreventUserIdleDisplaySleep" ||
+                       assertType == "NoDisplaySleepAssertion" ||
+                       assertName.contains("video") ||
+                       assertName.contains("audio") ||
+                       assertName.contains("media") ||
+                       assertName.contains("playing") {
+                        ids.insert(assertID)
+                    }
+                }
+            }
+        }
+        return ids
     }
 }

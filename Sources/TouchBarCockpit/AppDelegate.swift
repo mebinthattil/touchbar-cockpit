@@ -44,6 +44,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         MediaController.shared.onStateUpdated = { [weak self] state in
             self?.touchBarController.cockpitView.applyExternalMediaState(state)
+            if state.isPlaying {
+                self?.audioSpectrumTap.nudgeWake()
+            }
+        }
+        MediaController.shared.onPlaybackCommand = { [weak self] in
+            self?.audioSpectrumTap.nudgeWake()
         }
 
         // Initial sample + present Touch Bar

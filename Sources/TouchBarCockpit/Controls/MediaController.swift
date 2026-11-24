@@ -53,6 +53,8 @@ final class MediaController {
 
     // Called on main thread whenever live playback state or async artwork updates
     var onStateUpdated: ((NowPlayingState) -> Void)?
+    // Called on main thread whenever the user triggers play/pause/skip so AudioSpectrumTap can wake suppressed silent PIDs
+    var onPlaybackCommand: (() -> Void)?
 
     private lazy var urlSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
@@ -378,6 +380,10 @@ final class MediaController {
                 self.lastState.fetchedAt = Date()
             }
 
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                self?.onPlaybackCommand?()
+            }
+
             if let completion = completion {
                 self.queue.asyncAfter(deadline: .now() + 0.16) { [weak self] in
                     self?.fetchNowPlaying(completion: completion)
@@ -407,6 +413,10 @@ final class MediaController {
 
             if !handled {
                 TBPostAuxKey(19, false)
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
+                self?.onPlaybackCommand?()
             }
 
             if let completion = completion {
